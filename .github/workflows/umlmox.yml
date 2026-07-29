@@ -1,4 +1,4 @@
-name: Build and Release Debian UML Image
+name: Build and Release Proxmox-VE UML Image
 
 on:
   push:
@@ -9,7 +9,7 @@ on:
       hostname:
         description: 'Hostname for the image'
         required: true
-        default: 'dxomg'
+        default: 'pve-uml'
       root_password:
         description: 'Root password for the image'
         required: true
@@ -26,14 +26,10 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
 
-      - name: Install dependencies and download latest mmdebstrap from Salsa
+      - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y debian-archive-keyring qemu-utils libdpkg-perl genisoimage squashfs-tools curl e2fsprogs
-          
-          # Download the raw mmdebstrap script from official Debian GitLab and make executable
-          sudo curl -o /usr/local/bin/mmdebstrap https://salsa.debian.org/debian/mmdebstrap/-/raw/master/mmdebstrap
-          sudo chmod +x /usr/local/bin/mmdebstrap
+          sudo apt-get install -y debootstrap debian-archive-keyring qemu-utils e2fsprogs wget ca-certificates
 
       - name: Set variables
         id: vars
@@ -42,61 +38,157 @@ jobs:
             echo "HOSTNAME=${{ inputs.hostname }}" >> $GITHUB_ENV
             echo "ROOT_PASSWORD=${{ inputs.root_password }}" >> $GITHUB_ENV
           else
-            echo "HOSTNAME=dxomg" >> $GITHUB_ENV
+            echo "HOSTNAME=pve-uml" >> $GITHUB_ENV
             echo "ROOT_PASSWORD=root" >> $GITHUB_ENV
           fi
 
-      - name: Build Debian Image with mmdebstrap
+      - name: Build Ultra-Lightweight Proxmox VE Debian Trixie Image
         run: |
-          sudo mmdebstrap \
+          # 1. Create a strict 1.7GB raw image and format it as ext4
+          fallocate -l 1700M debian.img
+          sudo mkfs.ext4 -F -m 1 debian.img
+          
+          # 2. Mount the image
+          mkdir mnt
+          sudo mount -o loop debian.img mnt
+          
+          # 3. Run debootstrap with minimal packages (excluding heavy unneeded options)
+          sudo debootstrap \
             --variant=minbase \
             --components="main,contrib,non-free-firmware" \
-            --include=iproute2,netbase,ifupdown,iputils-ping,systemd,systemd-sysv,udev,apt,ca-certificates,dbus,openssh-server,nano,wget,curl,fastfetch,e2fsprogs \
-            --setup-hook='mkdir -p "$1/usr/sbin" && printf "#!/bin/sh\nexit 101\n" > "$1/usr/sbin/policy-rc.d" && chmod +x "$1/usr/sbin/policy-rc.d"' \
-            --customize-hook='
-              chroot "$1" /bin/bash << "CHROOT_EOF"
-              set -e
+            --include=iproute2,netbase,ifupdown,iputils-ping,systemd,systemd-sysv,udev,apt,ca-certificates,dbus,openssh-server,wget,curl,e2fsprogs \
+            trixie mnt http://deb.debian.org/debian
+          
+          # 4. Mount pseudo-filesystems 
+          sudo mount -t proc none mnt/proc
+          sudo mount -t sysfs none mnt/sys
+          sudo mount -o bind /dev mnt/dev
+          
+          # 5. Chroot and run lightweight setup
+          sudo chroot mnt /bin/bash << 'EOF'
+          export DEBIAN_FRONTEND=noninteractive
+          set -e
 
-              # Set root password
-              echo "root:${{ env.ROOT_PASSWORD }}" | chpasswd
+          # Set root password
+          echo "root:${{ env.ROOT_PASSWORD }}" | chpasswd
 
-              # Enable root SSH login
-              sed -i "s/#PermitRootLogin.*/PermitRootLogin yes/" /etc/ssh/sshd_config || echo "PermitRootLogin yes" >> /etc/ssh/sshd_config
+          # Enable root SSH login
+          sed -i 's/#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
 
-              # Clear MOTD
-              rm -rf /etc/update-motd.d/*
-              true > /etc/motd
+          # Clear MOTD & Logs
+          rm -rf /etc/update-motd.d/*
+          true > /etc/motd
 
-              # Create directories
-              mkdir -p /var/lib/vz/images/
+          # Create required paths
+          mkdir -p /var/lib/vz/images/
+          mkdir -p /usr/share/doc/pve-manager
+          touch /usr/share/doc/pve-manager/aplinfo.dat
 
-              # Set Hostname
-              echo "${{ env.HOSTNAME }}" > /etc/hostname
+          # Set Hostname
+          echo "${{ env.HOSTNAME }}" > /etc/hostname
 
-              # Configure /etc/hosts
-              cat << "HOSTS" > /etc/hosts
-          127.0.0.1	localhost.local
-          10.0.2.15	${{ env.HOSTNAME }}.local ${{ env.HOSTNAME }}
-
-          ::1		localhost ip6-localhost ip6-loopback
-          ff02::1		ip6-allnodes
-          ff02::2		ip6-allrouters
+          # Configure /etc/hosts
+          cat << 'HOSTS' > /etc/hosts
+          127.0.0.1    localhost.local
+          10.0.2.15    ${{ env.HOSTNAME }}.local ${{ env.HOSTNAME }}
+          ::1        localhost ip6-localhost ip6-loopback
           HOSTS
 
-              # Configure /etc/fstab
-              cat << "FSTAB" > /etc/fstab
+          # Configure /etc/fstab for UML
+          cat << 'FSTAB' > /etc/fstab
           /dev/ubda    /       ext4    defaults    0 1
           proc        /proc   proc    defaults    0 0
           sysfs       /sys    sysfs   defaults    0 0
           tmpfs       /run    tmpfs   nosuid,nodev,size=50%,mode=755  0 0
           FSTAB
 
-              # Enable tty0 console
-              mkdir -p /etc/systemd/system/getty.target.wants
-              ln -sf /lib/systemd/system/getty@.service /etc/systemd/system/getty.target.wants/getty@tty0.service
+          # Add Proxmox archive keyring
+          wget https://enterprise.proxmox.com/debian/proxmox-archive-keyring-trixie.gpg \
+            -O /usr/share/keyrings/proxmox-archive-keyring.gpg && \
+            echo "136673be77aba35dcce385b28737689ad64fd785a797e57897589aed08db6e45  /usr/share/keyrings/proxmox-archive-keyring.gpg" | sha256sum -c -
 
-              # Create uml-net.sh script
-              cat << "NETSCRIPT" > /usr/local/bin/uml-net.sh
+          # Add Proxmox VE no-subscription repository
+          printf 'Types: deb\nURIs: http://download.proxmox.com/debian/pve\nSuites: trixie\nComponents: pve-no-subscription\nSigned-By: /usr/share/keyrings/proxmox-archive-keyring.gpg\n' \
+            > /etc/apt/sources.list.d/pve-install-repo.sources
+
+          # Prevent services from starting during install
+          printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d && chmod +x /usr/sbin/policy-rc.d
+
+          # Stub unavailable commands / diverts
+          dpkg-divert --local --rename --add /usr/bin/unshare && \
+            printf '#!/bin/sh\nwhile [ $# -gt 0 ] && [ "$1" != "--" ]; do shift; done\n[ "$1" = "--" ] && shift\n[ $# -gt 0 ] && exec "$@"\nexit 0\n' \
+              > /usr/bin/unshare && chmod +x /usr/bin/unshare && \
+            dpkg-divert --local --rename --add /usr/sbin/update-initramfs && \
+            printf '#!/bin/sh\nexit 0\n' > /usr/sbin/update-initramfs && chmod +x /usr/sbin/update-initramfs && \
+            dpkg-divert --local --rename --add /usr/sbin/ifreload && \
+            printf '#!/bin/sh\nexit 0\n' > /usr/sbin/ifreload && chmod +x /usr/sbin/ifreload && \
+            printf '#!/bin/sh\nexit 0\n' > /usr/local/sbin/systemctl && chmod +x /usr/local/sbin/systemctl
+
+          # Pin ifupdown2
+          printf 'Package: ifupdown2\nPin: origin download.proxmox.com\nPin-Priority: 1001\n' \
+            > /etc/apt/preferences.d/proxmox-ifupdown2
+
+          # Install Proxmox VE (excluding heavy recommended packages like postfix/chrony if unnecessary, keeping core manager/pve-cluster)
+          apt-get update && \
+            apt-get install -y --no-install-recommends \
+              proxmox-ve \
+              open-iscsi && \
+            apt-get remove -y os-prober || true
+
+          # Remove enterprise and ceph repos
+          rm -f /etc/apt/sources.list.d/pve-enterprise.list \
+                /etc/apt/sources.list.d/pve-enterprise.sources \
+                /etc/apt/sources.list.d/ceph.list \
+                /etc/apt/sources.list.d/ceph.sources
+
+          # Fix ifreload for Proxmox GUI check
+          ln -sf ifupdown2 /usr/share/ifupdown2/ifreload && \
+            printf '#!/bin/sh\ncase "$1" in\n  -V|--version)\n    exec /usr/share/ifupdown2/ifreload -V\n    ;;\nesac\nexit 0\n' \
+              > /usr/sbin/ifreload && chmod +x /usr/sbin/ifreload
+
+          # Patch lxcfs service definition
+          printf '[Unit]\nDescription=FUSE filesystem for LXC\nBefore=lxc.service\nDocumentation=man:lxcfs(1)\n\n[Service]\nOOMScoreAdjust=-1000\nExecStartPre=/bin/mkdir -p /var/lib/lxcfs\nExecStart=/usr/bin/lxcfs /var/lib/lxcfs\nKillMode=process\nRestart=on-failure\nExecStopPost=-/bin/fusermount -u /var/lib/lxcfs\nDelegate=yes\nExecReload=/bin/kill -USR1 $MAINPID\n[Install]\nWantedBy=multi-user.target\n' > /lib/systemd/system/lxcfs.service
+
+          # Disable AppArmor for LXC containers
+          mkdir -p /usr/share/lxc/config/common.conf.d/
+          echo "lxc.apparmor.profile = unconfined" > /usr/share/lxc/config/common.conf.d/99-fix-apparmor.conf
+
+          # Aggressive cleanup of cache, docs, man pages, media components, locales, and firmware to squeeze under 1.7G
+          apt-get clean
+          rm -rf /var/lib/apt/lists/*
+          rm -rf /usr/lib/modules /boot /usr/lib/firmware
+          rm -rf /usr/share/locale/* /usr/share/i18n/*
+          rm -rf \
+            /usr/lib/x86_64-linux-gnu/libLLVM*.so* \
+            /usr/lib/x86_64-linux-gnu/libgallium*.so* \
+            /usr/lib/x86_64-linux-gnu/libvulkan_*.so* \
+            /usr/lib/x86_64-linux-gnu/libz3.so* \
+            /usr/lib/x86_64-linux-gnu/libx265.so* \
+            /usr/lib/x86_64-linux-gnu/libcodec2.so* \
+            /usr/lib/x86_64-linux-gnu/libavcodec.so* \
+            /usr/lib/x86_64-linux-gnu/libavfilter.so* \
+            /usr/lib/x86_64-linux-gnu/libSvtAv1Enc.so* \
+            /usr/lib/x86_64-linux-gnu/libplacebo.so* 2>/dev/null || true
+          rm -rf \
+            /usr/lib/x86_64-linux-gnu/dri \
+            /usr/lib/x86_64-linux-gnu/gstreamer-1.0 2>/dev/null || true
+          rm -rf \
+            /usr/share/pocketsphinx \
+            /usr/share/X11 \
+            /usr/share/alsa \
+            /usr/share/fonts \
+            /usr/share/grub \
+            /usr/share/groff \
+            /usr/share/mime \
+            /usr/share/doc \
+            /usr/share/man
+
+          # Enable tty0 console
+          mkdir -p /etc/systemd/system/getty.target.wants
+          ln -sf /lib/systemd/system/getty@.service /etc/systemd/system/getty.target.wants/getty@tty0.service
+
+          # Create network initialization script
+          cat << 'NETSCRIPT' > /usr/local/bin/uml-net.sh
           #!/bin/sh
           set -e
           DNS4="10.0.2.3"
@@ -112,38 +204,33 @@ jobs:
           }
 
           IFACE=$(find_iface) || { echo "[uml-net] ERROR: no vec0 or eth0 after ${TIMEOUT}s" >&2; exit 1; }
-          echo "[uml-net] Found interface: $IFACE"
           ip link set "$IFACE" up
 
-          # Ensure vmbr0 exists and is up
           ip link add name vmbr0 type bridge 2>/dev/null || true
           ip link set vmbr0 up
 
           case "$IFACE" in
               eth0) 
-                    ip link set eth0 master vmbr0 2>/dev/null || true
-                    ip addr add 10.0.2.1/24 dev vmbr0 2>/dev/null || true
-                    ip route replace default dev vmbr0
-                    echo "[uml-net] eth0 (SLIRP/SLIP) bridged to vmbr0: 10.0.2.1/24" ;;
+                  ip link set eth0 master vmbr0 2>/dev/null || true
+                  ip addr add 10.0.2.1/24 dev vmbr0 2>/dev/null || true
+                  ip route replace default dev vmbr0 ;;
               vec0) 
-                    ip link set vec0 master vmbr0 2>/dev/null || true
-                    ip addr add 10.0.2.15/24 dev vmbr0 2>/dev/null || true
-                    ip route replace default via 10.0.2.2 dev vmbr0
-                    ip -6 addr add fec0::15/64 dev vmbr0 2>/dev/null || true
-                    ip -6 route replace default via fec0::2 dev vmbr0
-                    echo "[uml-net] vec0 (VECTOR/VDE) bridged to vmbr0: 10.0.2.15/24 + fec0::15/64" ;;
+                  ip link set vec0 master vmbr0 2>/dev/null || true
+                  ip addr add 10.0.2.15/24 dev vmbr0 2>/dev/null || true
+                  ip route replace default via 10.0.2.2 dev vmbr0
+                  ip -6 addr add fec0::15/64 dev vmbr0 2>/dev/null || true
+                  ip -6 route replace default via fec0::2 dev vmbr0 ;;
           esac
 
           printf "nameserver %s\nnameserver %s\n" "$DNS4" "$DNS6" > /etc/resolv.conf
-          echo "[uml-net] DNS: $DNS4, $DNS6"
           NETSCRIPT
 
-              chmod +x /usr/local/bin/uml-net.sh
+          chmod +x /usr/local/bin/uml-net.sh
 
-              # Create uml-net.service
-              cat << "SERVICE" > /etc/systemd/system/uml-net.service
+          # Create network systemd service
+          cat << 'SERVICE' > /etc/systemd/system/uml-net.service
           [Unit]
-          Description=UML network auto-config (SLIRP or VDE VECTOR)
+          Description=UML network auto-config
           After=network-pre.target systemd-udevd.service
           Wants=network-pre.target
           Before=network.target
@@ -158,24 +245,14 @@ jobs:
           WantedBy=multi-user.target
           SERVICE
 
-              # Enable service
-              systemctl enable uml-net.service
-          CHROOT_EOF
-            ' \
-            --customize-hook='rm -f "$1/usr/sbin/policy-rc.d"' \
-            --format=ext4 \
-            stable \
-            debian.img
-
-      - name: Resize Image to 1.7G
-        run: |
-          truncate -s 1.7G debian.img
-          e2fsck -f -p debian.img || true
-          resize2fs debian.img
-
-      - name: Compress Image
-        run: |
-          gzip -k debian.img
+          systemctl enable uml-net.service
+          EOF
+          
+          # 6. Safely unmount everything
+          sudo umount mnt/proc
+          sudo umount mnt/sys
+          sudo umount mnt/dev
+          sudo umount mnt
 
       - name: Determine Release Tag
         id: tag
@@ -190,10 +267,9 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.tag.outputs.tag_name }}
-          name: Debian Stable UML Image (${{ steps.tag.outputs.tag_name }})
+          name: Lightweight Proxmox VE Trixie UML Image (${{ steps.tag.outputs.tag_name }})
           draft: false
           files: |
             debian.img
-            debian.img.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
