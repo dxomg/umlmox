@@ -1,0 +1,152 @@
+name: Build and Release Proxmox UML
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      hostname:
+        description: 'Hostname for the image'
+        required: true
+        default: 'dxomg'
+      root_password:
+        description: 'Root password for the image'
+        required: true
+        default: 'root'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mmdebstrap qemu-utils user-mode-linux
+
+      - name: Set variables
+        id: vars
+        run: |
+          # Use workflow input if manually triggered, otherwise fallback to tag/default
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "HOSTNAME=${{ inputs.hostname }}" >> $GITHUB_ENV
+            echo "ROOT_PASSWORD=${{ inputs.root_password }}" >> $GITHUB_ENV
+          else
+            echo "HOSTNAME=dxomg" >> $GITHUB_ENV
+            echo "ROOT_PASSWORD=root" >> $GITHUB_ENV
+          }
+
+      - name: Build Debian Image with mmdebstrap
+        run: |
+          sudo mmdebstrap \
+            --variant=minbase \
+            --components="main,contrib,non-free-firmware" \
+            --include=iproute2,netbase,ifupdown,iputils-ping,systemd,systemd-sysv,udev,apt,ca-certificates,dbus,openssh-server,nano,wget,curl,fastfetch,e2fsprogs \
+            --customize-hook="echo 'root:${{ env.ROOT_PASSWORD }}' | chroot \"\$1\" chpasswd" \
+            --customize-hook='sed -i "s/#PermitRootLogin.*/PermitRootLogin yes/" "$1/etc/ssh/sshd_config"' \
+            --customize-hook='rm -rf "$1/etc/update-motd.d/"*' \
+            --customize-hook='true > "$1/etc/motd"' \
+            --customize-hook='mkdir -p "$1/dev"' \
+            --customize-hook='mkdir -p "$1/var/lib/vz/images/"' \
+            --customize-hook="echo '${{ env.HOSTNAME }}' > \"\$1/etc/hostname\"" \
+            --customize-hook="printf \"127.0.0.1\tlocalhost.local\n10.0.2.15\t${{ env.HOSTNAME }}.local ${{ env.HOSTNAME }}\n\n::1\t\tlocalhost ip6-localhost ip6-loopback\nff02::1\t\tip6-allnodes\nff02::2\t\tip6-allrouters\n\" > \"\$1/etc/hosts\"" \
+            --customize-hook='printf "/dev/ubda    /       ext4    defaults    0 1\nproc        /proc   proc    defaults    0 0\nsysfs       /sys    sysfs   defaults    0 0\ntmpfs       /run    tmpfs   nosuid,nodev,size=50%%,mode=755  0 0\n" > "$1/etc/fstab"' \
+            --customize-hook='mkdir -p "$1/etc/systemd/system/getty.target.wants"' \
+            --customize-hook='ln -sf /lib/systemd/system/getty@.service "$1/etc/systemd/system/getty.target.wants/getty@tty0.service"' \
+            --customize-hook='
+              cat << "EOF" > "$1/usr/local/bin/uml-net.sh"
+          #!/bin/sh
+          set -e
+          DNS4="10.0.2.3"
+          DNS6="fec0::3"
+          TIMEOUT=30
+
+          find_iface() {
+              for _i in $(seq 1 "$TIMEOUT"); do
+                  for dev in vec0 eth0; do
+                      if ip link show "$dev" >/dev/null 2>&1; then echo "$dev"; return 0; fi
+                  done; sleep 1
+              done; return 1
+          }
+
+          IFACE=$(find_iface) || { echo "[uml-net] ERROR: no vec0 or eth0 after ${TIMEOUT}s" >&2; exit 1; }
+          echo "[uml-net] Found interface: $IFACE"
+          ip link set "$IFACE" up
+
+          # Ensure vmbr0 exists and is up
+          ip link add name vmbr0 type bridge 2>/dev/null || true
+          ip link set vmbr0 up
+
+          case "$IFACE" in
+              eth0) 
+                    ip link set eth0 master vmbr0 2>/dev/null || true
+                    ip addr add 10.0.2.1/24 dev vmbr0 2>/dev/null || true
+                    ip route replace default dev vmbr0
+                    echo "[uml-net] eth0 (SLIRP/SLIP) bridged to vmbr0: 10.0.2.1/24" ;;
+              vec0) 
+                    ip link set vec0 master vmbr0 2>/dev/null || true
+                    ip addr add 10.0.2.15/24 dev vmbr0 2>/dev/null || true
+                    ip route replace default via 10.0.2.2 dev vmbr0
+                    ip -6 addr add fec0::15/64 dev vmbr0 2>/dev/null || true
+                    ip -6 route replace default via fec0::2 dev vmbr0 2>/dev/null || true
+                    echo "[uml-net] vec0 (VECTOR/VDE) bridged to vmbr0: 10.0.2.15/24 + fec0::15/64" ;;
+          esac
+
+          printf "nameserver %s\nnameserver %s\n" "$DNS4" "$DNS6" > /etc/resolv.conf
+          echo "[uml-net] DNS: $DNS4, $DNS6"
+          EOF
+              chmod +x "$1/usr/local/bin/uml-net.sh"
+            ' \
+            --customize-hook='
+              cat << "EOF" > "$1/etc/systemd/system/uml-net.service"
+          [Unit]
+          Description=UML network auto-config (SLIRP or VDE VECTOR)
+          After=network-pre.target systemd-udevd.service
+          Wants=network-pre.target
+          Before=network.target
+          DefaultDependencies=no
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/bin/uml-net.sh
+          RemainAfterExit=yes
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+              chroot "$1" systemctl enable uml-net.service
+            ' \
+            --format=ext4 \
+            trixie \
+            debian.img
+
+      - name: Compress Image
+        run: |
+          gzip -k debian.img
+
+      - name: Determine Release Tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag_name=manual-build-$(date +%Y%m%d-%H%M%S)" >> $GITHUB_OUTPUT
+            echo "is_draft=true" >> $GITHUB_OUTPUT
+          else
+            echo "tag_name=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+            echo "is_draft=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create Release and Upload Asset
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.tag.outputs.tag_name }}
+          name: Debian Trixie UML Image (${{ steps.tag.outputs.tag_name }})
+          draft: ${{ steps.tag.outputs.is_draft }}
+          files: |
+            debian.img
+            debian.img.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
