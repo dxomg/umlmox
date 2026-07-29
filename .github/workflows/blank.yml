@@ -1,4 +1,4 @@
-name: Build and Release Proxmox UML
+name: Build and Release Debian UML Image
 
 on:
   push:
@@ -26,19 +26,18 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y mmdebstrap qemu-utils user-mode-linux
+          sudo apt-get install -y mmdebstrap qemu-utils
 
       - name: Set variables
         id: vars
         run: |
-          # Use workflow input if manually triggered, otherwise fallback to tag/default
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "HOSTNAME=${{ inputs.hostname }}" >> $GITHUB_ENV
             echo "ROOT_PASSWORD=${{ inputs.root_password }}" >> $GITHUB_ENV
           else
             echo "HOSTNAME=dxomg" >> $GITHUB_ENV
             echo "ROOT_PASSWORD=root" >> $GITHUB_ENV
-          }
+          fi
 
       - name: Build Debian Image with mmdebstrap
         run: |
