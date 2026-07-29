@@ -44,8 +44,8 @@ jobs:
 
       - name: Build Proxmox Debian Trixie Image with debootstrap
         run: |
-          # 1. Create a 4.5GB raw image (Proxmox VE needs more space than minbase) and format it as ext4
-          fallocate -l 4500M debian.img
+          # 1. Create a 1.7GB raw image and format it as ext4
+          fallocate -l 1700M debian.img
           sudo mkfs.ext4 -F debian.img
           
           # 2. Mount the image
@@ -163,7 +163,30 @@ jobs:
           apt-get clean
           rm -rf /var/lib/apt/lists/*
           rm -rf /usr/lib/modules /boot /usr/lib/firmware
-          rm -rf /usr/share/pocketsphinx /usr/share/X11 /usr/share/alsa /usr/share/fonts /usr/share/grub /usr/share/groff /usr/share/mime /usr/share/doc /usr/share/man
+          rm -rf \
+            /usr/lib/x86_64-linux-gnu/libLLVM*.so* \
+            /usr/lib/x86_64-linux-gnu/libgallium*.so* \
+            /usr/lib/x86_64-linux-gnu/libvulkan_*.so* \
+            /usr/lib/x86_64-linux-gnu/libz3.so* \
+            /usr/lib/x86_64-linux-gnu/libx265.so* \
+            /usr/lib/x86_64-linux-gnu/libcodec2.so* \
+            /usr/lib/x86_64-linux-gnu/libavcodec.so* \
+            /usr/lib/x86_64-linux-gnu/libavfilter.so* \
+            /usr/lib/x86_64-linux-gnu/libSvtAv1Enc.so* \
+            /usr/lib/x86_64-linux-gnu/libplacebo.so* 2>/dev/null || true
+          rm -rf \
+            /usr/lib/x86_64-linux-gnu/dri \
+            /usr/lib/x86_64-linux-gnu/gstreamer-1.0 2>/dev/null || true
+          rm -rf \
+            /usr/share/pocketsphinx \
+            /usr/share/X11 \
+            /usr/share/alsa \
+            /usr/share/fonts \
+            /usr/share/grub \
+            /usr/share/groff \
+            /usr/share/mime \
+            /usr/share/doc \
+            /usr/share/man
 
           # Enable tty0 console
           mkdir -p /etc/systemd/system/getty.target.wants
