@@ -1,3 +1,4 @@
+```yaml
 name: Build and Release Debian UML Image
 
 on:
@@ -24,7 +25,7 @@ jobs:
     
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install dependencies
         run: |
@@ -183,19 +184,19 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "tag_name=manual-build-$(date +%Y%m%d-%H%M%S)" >> $GITHUB_OUTPUT
-            echo "is_draft=true" >> $GITHUB_OUTPUT
           else
             echo "tag_name=${{ github.ref_name }}" >> $GITHUB_OUTPUT
-            echo "is_draft=false" >> $GITHUB_OUTPUT
           fi
 
       - name: Create Release and Upload Asset
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.tag.outputs.tag_name }}
           name: Debian Stable UML Image (${{ steps.tag.outputs.tag_name }})
-          draft: ${{ steps.tag.outputs.is_draft }}
+          draft: false
           files: |
             debian.img
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+```
