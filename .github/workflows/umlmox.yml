@@ -23,13 +23,13 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install dependencies and download latest mmdebstrap from GitHub
+      - name: Install dependencies and download latest mmdebstrap from Salsa
         run: |
           sudo apt-get update
           sudo apt-get install -y debian-archive-keyring qemu-utils libdpkg-perl genisoimage squashfs-tools curl
           
-          # Download the raw mmdebstrap script and make it executable
-          sudo curl -o /usr/local/bin/mmdebstrap https://raw.githubusercontent.com/deepin-community/mmdebstrap/refs/heads/master/mmdebstrap
+          # Download the raw mmdebstrap script from the official Debian GitLab and make it executable
+          sudo curl -o /usr/local/bin/mmdebstrap https://salsa.debian.org/debian/mmdebstrap/-/raw/master/mmdebstrap
           sudo chmod +x /usr/local/bin/mmdebstrap
 
       - name: Set variables
