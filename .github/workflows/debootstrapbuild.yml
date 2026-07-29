@@ -15,7 +15,6 @@ on:
         required: true
         default: 'root'
 
-# Fixes the 403 error by giving the token permission to create releases
 permissions:
   contents: write
 
@@ -45,8 +44,8 @@ jobs:
 
       - name: Build Debian Image with debootstrap
         run: |
-          # 1. Create a 2GB raw image and format it as ext4
-          fallocate -l 2G debian.img
+          # 1. Create a 1.7GB raw image and format it as ext4 (stays safely under GitHub's 2GB limit)
+          fallocate -l 1700M debian.img
           sudo mkfs.ext4 -F debian.img
           
           # 2. Mount the image
@@ -60,7 +59,7 @@ jobs:
             --include=iproute2,netbase,ifupdown,iputils-ping,systemd,systemd-sysv,udev,apt,ca-certificates,dbus,openssh-server,nano,wget,curl,fastfetch,e2fsprogs \
             stable mnt http://deb.debian.org/debian
             
-          # 4. Mount pseudo-filesystems (fixes the /proc/ and /sys/ warnings)
+          # 4. Mount pseudo-filesystems 
           sudo mount -t proc none mnt/proc
           sudo mount -t sysfs none mnt/sys
           sudo mount -o bind /dev mnt/dev
@@ -179,10 +178,6 @@ jobs:
           sudo umount mnt/dev
           sudo umount mnt
 
-      - name: Compress Image
-        run: |
-          gzip -k debian.img
-
       - name: Determine Release Tag
         id: tag
         run: |
@@ -202,6 +197,5 @@ jobs:
           draft: ${{ steps.tag.outputs.is_draft }}
           files: |
             debian.img
-            debian.img.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
