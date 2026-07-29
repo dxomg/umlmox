@@ -44,7 +44,7 @@ jobs:
 
       - name: Build Debian Image with debootstrap
         run: |
-          # 1. Create a 1.7GB raw image and format it as ext4 (stays safely under GitHub's 2GB limit)
+          # 1. Create a 1.7GB raw image and format it as ext4
           fallocate -l 1700M debian.img
           sudo mkfs.ext4 -F debian.img
           
@@ -64,47 +64,50 @@ jobs:
           sudo mount -t sysfs none mnt/sys
           sudo mount -o bind /dev mnt/dev
           
-          # 5. Apply customizations
+          # 5. Chroot and run setup commands directly inside the image
+          sudo chroot mnt /bin/bash << 'EOF'
+          set -e
+
           # Set root password
-          echo "root:${{ env.ROOT_PASSWORD }}" | sudo chroot mnt chpasswd
-          
+          echo "root:${{ env.ROOT_PASSWORD }}" | chpasswd
+
           # Enable root SSH login
-          sudo sed -i 's/#PermitRootLogin.*/PermitRootLogin yes/' mnt/etc/ssh/sshd_config
-          
+          sed -i 's/#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+
           # Clear MOTD
-          sudo rm -rf mnt/etc/update-motd.d/*
-          sudo bash -c 'true > mnt/etc/motd'
-          
+          rm -rf /etc/update-motd.d/*
+          true > /etc/motd
+
           # Create missing directories
-          sudo mkdir -p mnt/var/lib/vz/images/
-          
+          mkdir -p /var/lib/vz/images/
+
           # Set Hostname
-          echo "${{ env.HOSTNAME }}" | sudo tee mnt/etc/hostname
-          
+          echo "${{ env.HOSTNAME }}" > /etc/hostname
+
           # Configure /etc/hosts
-          sudo tee mnt/etc/hosts >/dev/null <<EOF
+          cat << 'HOSTS' > /etc/hosts
           127.0.0.1	localhost.local
           10.0.2.15	${{ env.HOSTNAME }}.local ${{ env.HOSTNAME }}
-          
+
           ::1		localhost ip6-localhost ip6-loopback
           ff02::1		ip6-allnodes
           ff02::2		ip6-allrouters
-          EOF
-          
+          HOSTS
+
           # Configure /etc/fstab
-          sudo tee mnt/etc/fstab >/dev/null <<EOF
+          cat << 'FSTAB' > /etc/fstab
           /dev/ubda    /       ext4    defaults    0 1
           proc        /proc   proc    defaults    0 0
           sysfs       /sys    sysfs   defaults    0 0
           tmpfs       /run    tmpfs   nosuid,nodev,size=50%,mode=755  0 0
-          EOF
-          
+          FSTAB
+
           # Enable tty0 console
-          sudo mkdir -p mnt/etc/systemd/system/getty.target.wants
-          sudo ln -sf /lib/systemd/system/getty@.service mnt/etc/systemd/system/getty.target.wants/getty@tty0.service
-          
+          mkdir -p /etc/systemd/system/getty.target.wants
+          ln -sf /lib/systemd/system/getty@.service /etc/systemd/system/getty.target.wants/getty@tty0.service
+
           # Create uml-net.sh script
-          sudo tee mnt/usr/local/bin/uml-net.sh >/dev/null <<"EOF"
+          cat << 'NETSCRIPT' > /usr/local/bin/uml-net.sh
           #!/bin/sh
           set -e
           DNS4="10.0.2.3"
@@ -144,12 +147,12 @@ jobs:
 
           printf "nameserver %s\nnameserver %s\n" "$DNS4" "$DNS6" > /etc/resolv.conf
           echo "[uml-net] DNS: $DNS4, $DNS6"
-          EOF
-          
-          sudo chmod +x mnt/usr/local/bin/uml-net.sh
-          
-          # Create and enable uml-net.service
-          sudo tee mnt/etc/systemd/system/uml-net.service >/dev/null <<"EOF"
+          NETSCRIPT
+
+          chmod +x /usr/local/bin/uml-net.sh
+
+          # Create uml-net.service
+          cat << 'SERVICE' > /etc/systemd/system/uml-net.service
           [Unit]
           Description=UML network auto-config (SLIRP or VDE VECTOR)
           After=network-pre.target systemd-udevd.service
@@ -164,15 +167,17 @@ jobs:
 
           [Install]
           WantedBy=multi-user.target
+          SERVICE
+
+          # Enable service
+          systemctl enable uml-net.service
+
+          # Clean up apt cache inside chroot
+          apt-get clean
+          rm -rf /var/lib/apt/lists/*
           EOF
           
-          sudo chroot mnt systemctl enable uml-net.service
-          
-          # 6. Clean up apt cache and unmount pseudo-filesystems
-          sudo chroot mnt apt-get clean
-          sudo rm -rf mnt/var/lib/apt/lists/*
-          
-          # Safely unmount everything
+          # 6. Safely unmount everything
           sudo umount mnt/proc
           sudo umount mnt/sys
           sudo umount mnt/dev
