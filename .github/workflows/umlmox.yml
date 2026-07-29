@@ -42,9 +42,9 @@ jobs:
             echo "ROOT_PASSWORD=root" >> $GITHUB_ENV
           fi
 
-      - name: Build Ultra-Lightweight Proxmox VE Debian Trixie Image
+      - name: Build Proxmox VE Image with PVE Kernel & Firmware
         run: |
-          # 1. Create a strict 1.7GB raw image and format it as ext4
+          # 1. Create a 1.7GB raw image and format it as ext4
           fallocate -l 1700M debian.img
           sudo mkfs.ext4 -F -m 1 debian.img
           
@@ -52,7 +52,7 @@ jobs:
           mkdir mnt
           sudo mount -o loop debian.img mnt
           
-          # 3. Run debootstrap with minimal packages (excluding heavy unneeded options)
+          # 3. Run debootstrap with minimal base
           sudo debootstrap \
             --variant=minbase \
             --components="main,contrib,non-free-firmware" \
@@ -64,7 +64,7 @@ jobs:
           sudo mount -t sysfs none mnt/sys
           sudo mount -o bind /dev mnt/dev
           
-          # 5. Chroot and run lightweight setup
+          # 5. Chroot and setup
           sudo chroot mnt /bin/bash << 'EOF'
           export DEBIAN_FRONTEND=noninteractive
           set -e
@@ -128,10 +128,12 @@ jobs:
           printf 'Package: ifupdown2\nPin: origin download.proxmox.com\nPin-Priority: 1001\n' \
             > /etc/apt/preferences.d/proxmox-ifupdown2
 
-          # Install Proxmox VE (excluding heavy recommended packages like postfix/chrony if unnecessary, keeping core manager/pve-cluster)
+          # Install Proxmox VE including explicit pve-kernel and pve-firmware packages
           apt-get update && \
             apt-get install -y --no-install-recommends \
               proxmox-ve \
+              pve-kernel-6.14 \
+              pve-firmware \
               open-iscsi && \
             apt-get remove -y os-prober || true
 
@@ -153,35 +155,9 @@ jobs:
           mkdir -p /usr/share/lxc/config/common.conf.d/
           echo "lxc.apparmor.profile = unconfined" > /usr/share/lxc/config/common.conf.d/99-fix-apparmor.conf
 
-          # Aggressive cleanup of cache, docs, man pages, media components, locales, and firmware to squeeze under 1.7G
+          # Clean up apt lists only
           apt-get clean
           rm -rf /var/lib/apt/lists/*
-          rm -rf /usr/lib/modules /boot /usr/lib/firmware
-          rm -rf /usr/share/locale/* /usr/share/i18n/*
-          rm -rf \
-            /usr/lib/x86_64-linux-gnu/libLLVM*.so* \
-            /usr/lib/x86_64-linux-gnu/libgallium*.so* \
-            /usr/lib/x86_64-linux-gnu/libvulkan_*.so* \
-            /usr/lib/x86_64-linux-gnu/libz3.so* \
-            /usr/lib/x86_64-linux-gnu/libx265.so* \
-            /usr/lib/x86_64-linux-gnu/libcodec2.so* \
-            /usr/lib/x86_64-linux-gnu/libavcodec.so* \
-            /usr/lib/x86_64-linux-gnu/libavfilter.so* \
-            /usr/lib/x86_64-linux-gnu/libSvtAv1Enc.so* \
-            /usr/lib/x86_64-linux-gnu/libplacebo.so* 2>/dev/null || true
-          rm -rf \
-            /usr/lib/x86_64-linux-gnu/dri \
-            /usr/lib/x86_64-linux-gnu/gstreamer-1.0 2>/dev/null || true
-          rm -rf \
-            /usr/share/pocketsphinx \
-            /usr/share/X11 \
-            /usr/share/alsa \
-            /usr/share/fonts \
-            /usr/share/grub \
-            /usr/share/groff \
-            /usr/share/mime \
-            /usr/share/doc \
-            /usr/share/man
 
           # Enable tty0 console
           mkdir -p /etc/systemd/system/getty.target.wants
@@ -267,7 +243,7 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.tag.outputs.tag_name }}
-          name: Lightweight Proxmox VE Trixie UML Image (${{ steps.tag.outputs.tag_name }})
+          name: Proxmox VE Trixie UML Image with PVE Kernel (${{ steps.tag.outputs.tag_name }})
           draft: false
           files: |
             debian.img
