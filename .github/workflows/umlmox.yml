@@ -23,13 +23,10 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install dependencies and latest mmdebstrap
+      - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-utils libdpkg-perl genisoimage squashfs-tools
-          curl -o mmdebstrap https://raw.githubusercontent.com/deepin-community/mmdebstrap/main/mmdebstrap
-          chmod +x mmdebstrap
-          sudo mv mmdebstrap /usr/local/bin/
+          sudo apt-get install -y mmdebstrap qemu-utils
 
       - name: Set variables
         id: vars
@@ -123,7 +120,7 @@ jobs:
               chroot "$1" systemctl enable uml-net.service
             ' \
             --format=ext4 \
-            trixie \
+            stable \
             debian.img
 
       - name: Compress Image
