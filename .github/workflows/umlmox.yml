@@ -15,20 +15,23 @@ on:
         required: true
         default: 'root'
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
     
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install dependencies and download latest mmdebstrap from Salsa
         run: |
           sudo apt-get update
-          sudo apt-get install -y debian-archive-keyring qemu-utils libdpkg-perl genisoimage squashfs-tools curl
+          sudo apt-get install -y debian-archive-keyring qemu-utils libdpkg-perl genisoimage squashfs-tools curl e2fsprogs
           
-          # Download the raw mmdebstrap script from the official Debian GitLab and make it executable
+          # Download the raw mmdebstrap script from official Debian GitLab and make executable
           sudo curl -o /usr/local/bin/mmdebstrap https://salsa.debian.org/debian/mmdebstrap/-/raw/master/mmdebstrap
           sudo chmod +x /usr/local/bin/mmdebstrap
 
@@ -49,20 +52,51 @@ jobs:
             --variant=minbase \
             --components="main,contrib,non-free-firmware" \
             --include=iproute2,netbase,ifupdown,iputils-ping,systemd,systemd-sysv,udev,apt,ca-certificates,dbus,openssh-server,nano,wget,curl,fastfetch,e2fsprogs \
-            --skip=cleanup \
-            --customize-hook="echo 'root:${{ env.ROOT_PASSWORD }}' | chroot \"\$1\" chpasswd" \
-            --customize-hook='echo "PermitRootLogin yes" >> "$1/etc/ssh/sshd_config"' \
-            --customize-hook='rm -rf "$1/etc/update-motd.d/"*' \
-            --customize-hook='true > "$1/etc/motd"' \
-            --customize-hook='mkdir -p "$1/dev"' \
-            --customize-hook='mkdir -p "$1/var/lib/vz/images/"' \
-            --customize-hook="echo '${{ env.HOSTNAME }}' > \"\$1/etc/hostname\"" \
-            --customize-hook="printf \"127.0.0.1\tlocalhost.local\n10.0.2.15\t${{ env.HOSTNAME }}.local ${{ env.HOSTNAME }}\n\n::1\t\tlocalhost ip6-localhost ip6-loopback\nff02::1\t\tip6-allnodes\nff02::2\t\tip6-allrouters\n\" > \"\$1/etc/hosts\"" \
-            --customize-hook='printf "/dev/ubda    /       ext4    defaults    0 1\nproc        /proc   proc    defaults    0 0\nsysfs       /sys    sysfs   defaults    0 0\ntmpfs       /run    tmpfs   nosuid,nodev,size=50%%,mode=755  0 0\n" > "$1/etc/fstab"' \
-            --customize-hook='mkdir -p "$1/etc/systemd/system/getty.target.wants"' \
-            --customize-hook='ln -sf /lib/systemd/system/getty@.service "$1/etc/systemd/system/getty.target.wants/getty@tty0.service"' \
+            --setup-hook='mkdir -p "$1/usr/sbin" && printf "#!/bin/sh\nexit 101\n" > "$1/usr/sbin/policy-rc.d" && chmod +x "$1/usr/sbin/policy-rc.d"' \
             --customize-hook='
-              cat << "EOF" > "$1/usr/local/bin/uml-net.sh"
+              chroot "$1" /bin/bash << "CHROOT_EOF"
+              set -e
+
+              # Set root password
+              echo "root:${{ env.ROOT_PASSWORD }}" | chpasswd
+
+              # Enable root SSH login
+              sed -i "s/#PermitRootLogin.*/PermitRootLogin yes/" /etc/ssh/sshd_config || echo "PermitRootLogin yes" >> /etc/ssh/sshd_config
+
+              # Clear MOTD
+              rm -rf /etc/update-motd.d/*
+              true > /etc/motd
+
+              # Create directories
+              mkdir -p /var/lib/vz/images/
+
+              # Set Hostname
+              echo "${{ env.HOSTNAME }}" > /etc/hostname
+
+              # Configure /etc/hosts
+              cat << "HOSTS" > /etc/hosts
+          127.0.0.1	localhost.local
+          10.0.2.15	${{ env.HOSTNAME }}.local ${{ env.HOSTNAME }}
+
+          ::1		localhost ip6-localhost ip6-loopback
+          ff02::1		ip6-allnodes
+          ff02::2		ip6-allrouters
+          HOSTS
+
+              # Configure /etc/fstab
+              cat << "FSTAB" > /etc/fstab
+          /dev/ubda    /       ext4    defaults    0 1
+          proc        /proc   proc    defaults    0 0
+          sysfs       /sys    sysfs   defaults    0 0
+          tmpfs       /run    tmpfs   nosuid,nodev,size=50%,mode=755  0 0
+          FSTAB
+
+              # Enable tty0 console
+              mkdir -p /etc/systemd/system/getty.target.wants
+              ln -sf /lib/systemd/system/getty@.service /etc/systemd/system/getty.target.wants/getty@tty0.service
+
+              # Create uml-net.sh script
+              cat << "NETSCRIPT" > /usr/local/bin/uml-net.sh
           #!/bin/sh
           set -e
           DNS4="10.0.2.3"
@@ -102,11 +136,12 @@ jobs:
 
           printf "nameserver %s\nnameserver %s\n" "$DNS4" "$DNS6" > /etc/resolv.conf
           echo "[uml-net] DNS: $DNS4, $DNS6"
-          EOF
-              chmod +x "$1/usr/local/bin/uml-net.sh"
-            ' \
-            --customize-hook='
-              cat << "EOF" > "$1/etc/systemd/system/uml-net.service"
+          NETSCRIPT
+
+              chmod +x /usr/local/bin/uml-net.sh
+
+              # Create uml-net.service
+              cat << "SERVICE" > /etc/systemd/system/uml-net.service
           [Unit]
           Description=UML network auto-config (SLIRP or VDE VECTOR)
           After=network-pre.target systemd-udevd.service
@@ -121,12 +156,22 @@ jobs:
 
           [Install]
           WantedBy=multi-user.target
-          EOF
-              chroot "$1" systemctl enable uml-net.service
+          SERVICE
+
+              # Enable service
+              systemctl enable uml-net.service
+          CHROOT_EOF
             ' \
+            --customize-hook='rm -f "$1/usr/sbin/policy-rc.d"' \
             --format=ext4 \
             stable \
             debian.img
+
+      - name: Resize Image to 1.7G
+        run: |
+          truncate -s 1.7G debian.img
+          e2fsck -f -p debian.img || true
+          resize2fs debian.img
 
       - name: Compress Image
         run: |
@@ -137,18 +182,16 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "tag_name=manual-build-$(date +%Y%m%d-%H%M%S)" >> $GITHUB_OUTPUT
-            echo "is_draft=true" >> $GITHUB_OUTPUT
           else
             echo "tag_name=${{ github.ref_name }}" >> $GITHUB_OUTPUT
-            echo "is_draft=false" >> $GITHUB_OUTPUT
           fi
 
       - name: Create Release and Upload Asset
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.tag.outputs.tag_name }}
           name: Debian Stable UML Image (${{ steps.tag.outputs.tag_name }})
-          draft: ${{ steps.tag.outputs.is_draft }}
+          draft: false
           files: |
             debian.img
             debian.img.gz
