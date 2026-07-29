@@ -1,0 +1,193 @@
+name: Build and Release Debian UML Image
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      hostname:
+        description: 'Hostname for the image'
+        required: true
+        default: 'dxomg'
+      root_password:
+        description: 'Root password for the image'
+        required: true
+        default: 'root'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y debootstrap debian-archive-keyring qemu-utils e2fsprogs
+
+      - name: Set variables
+        id: vars
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "HOSTNAME=${{ inputs.hostname }}" >> $GITHUB_ENV
+            echo "ROOT_PASSWORD=${{ inputs.root_password }}" >> $GITHUB_ENV
+          else
+            echo "HOSTNAME=dxomg" >> $GITHUB_ENV
+            echo "ROOT_PASSWORD=root" >> $GITHUB_ENV
+          fi
+
+      - name: Build Debian Image with debootstrap
+        run: |
+          # 1. Create a 2GB raw image and format it as ext4
+          fallocate -l 2G debian.img
+          sudo mkfs.ext4 -F debian.img
+          
+          # 2. Mount the image
+          mkdir mnt
+          sudo mount -o loop debian.img mnt
+          
+          # 3. Run debootstrap into the mounted image
+          sudo debootstrap \
+            --variant=minbase \
+            --components="main,contrib,non-free-firmware" \
+            --include=iproute2,netbase,ifupdown,iputils-ping,systemd,systemd-sysv,udev,apt,ca-certificates,dbus,openssh-server,nano,wget,curl,fastfetch,e2fsprogs \
+            stable mnt http://deb.debian.org/debian
+            
+          # 4. Apply customizations
+          # Set root password
+          echo "root:${{ env.ROOT_PASSWORD }}" | sudo chroot mnt chpasswd
+          
+          # Enable root SSH login
+          sudo sed -i 's/#PermitRootLogin.*/PermitRootLogin yes/' mnt/etc/ssh/sshd_config
+          
+          # Clear MOTD
+          sudo rm -rf mnt/etc/update-motd.d/*
+          sudo bash -c 'true > mnt/etc/motd'
+          
+          # Create missing directories
+          sudo mkdir -p mnt/dev mnt/var/lib/vz/images/
+          
+          # Set Hostname
+          echo "${{ env.HOSTNAME }}" | sudo tee mnt/etc/hostname
+          
+          # Configure /etc/hosts (Evaluates GitHub Env variables)
+          sudo tee mnt/etc/hosts >/dev/null <<EOF
+          127.0.0.1	localhost.local
+          10.0.2.15	${{ env.HOSTNAME }}.local ${{ env.HOSTNAME }}
+          
+          ::1		localhost ip6-localhost ip6-loopback
+          ff02::1		ip6-allnodes
+          ff02::2		ip6-allrouters
+          EOF
+          
+          # Configure /etc/fstab
+          sudo tee mnt/etc/fstab >/dev/null <<EOF
+          /dev/ubda    /       ext4    defaults    0 1
+          proc        /proc   proc    defaults    0 0
+          sysfs       /sys    sysfs   defaults    0 0
+          tmpfs       /run    tmpfs   nosuid,nodev,size=50%,mode=755  0 0
+          EOF
+          
+          # Enable tty0 console
+          sudo mkdir -p mnt/etc/systemd/system/getty.target.wants
+          sudo ln -sf /lib/systemd/system/getty@.service mnt/etc/systemd/system/getty.target.wants/getty@tty0.service
+          
+          # Create uml-net.sh script (Quoted EOF prevents runner from expanding internal variables)
+          sudo tee mnt/usr/local/bin/uml-net.sh >/dev/null <<"EOF"
+          #!/bin/sh
+          set -e
+          DNS4="10.0.2.3"
+          DNS6="fec0::3"
+          TIMEOUT=30
+
+          find_iface() {
+              for _i in $(seq 1 "$TIMEOUT"); do
+                  for dev in vec0 eth0; do
+                      if ip link show "$dev" >/dev/null 2>&1; then echo "$dev"; return 0; fi
+                  done; sleep 1
+              done; return 1
+          }
+
+          IFACE=$(find_iface) || { echo "[uml-net] ERROR: no vec0 or eth0 after ${TIMEOUT}s" >&2; exit 1; }
+          echo "[uml-net] Found interface: $IFACE"
+          ip link set "$IFACE" up
+
+          # Ensure vmbr0 exists and is up
+          ip link add name vmbr0 type bridge 2>/dev/null || true
+          ip link set vmbr0 up
+
+          case "$IFACE" in
+              eth0) 
+                    ip link set eth0 master vmbr0 2>/dev/null || true
+                    ip addr add 10.0.2.1/24 dev vmbr0 2>/dev/null || true
+                    ip route replace default dev vmbr0
+                    echo "[uml-net] eth0 (SLIRP/SLIP) bridged to vmbr0: 10.0.2.1/24" ;;
+              vec0) 
+                    ip link set vec0 master vmbr0 2>/dev/null || true
+                    ip addr add 10.0.2.15/24 dev vmbr0 2>/dev/null || true
+                    ip route replace default via 10.0.2.2 dev vmbr0
+                    ip -6 addr add fec0::15/64 dev vmbr0 2>/dev/null || true
+                    ip -6 route replace default via fec0::2 dev vmbr0
+                    echo "[uml-net] vec0 (VECTOR/VDE) bridged to vmbr0: 10.0.2.15/24 + fec0::15/64" ;;
+          esac
+
+          printf "nameserver %s\nnameserver %s\n" "$DNS4" "$DNS6" > /etc/resolv.conf
+          echo "[uml-net] DNS: $DNS4, $DNS6"
+          EOF
+          
+          sudo chmod +x mnt/usr/local/bin/uml-net.sh
+          
+          # Create and enable uml-net.service
+          sudo tee mnt/etc/systemd/system/uml-net.service >/dev/null <<"EOF"
+          [Unit]
+          Description=UML network auto-config (SLIRP or VDE VECTOR)
+          After=network-pre.target systemd-udevd.service
+          Wants=network-pre.target
+          Before=network.target
+          DefaultDependencies=no
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/bin/uml-net.sh
+          RemainAfterExit=yes
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+          
+          sudo chroot mnt systemctl enable uml-net.service
+          
+          # 5. Clean up apt cache and unmount
+          sudo chroot mnt apt-get clean
+          sudo rm -rf mnt/var/lib/apt/lists/*
+          sudo umount mnt
+
+      - name: Compress Image
+        run: |
+          gzip -k debian.img
+
+      - name: Determine Release Tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag_name=manual-build-$(date +%Y%m%d-%H%M%S)" >> $GITHUB_OUTPUT
+            echo "is_draft=true" >> $GITHUB_OUTPUT
+          else
+            echo "tag_name=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+            echo "is_draft=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create Release and Upload Asset
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.tag.outputs.tag_name }}
+          name: Debian Stable UML Image (${{ steps.tag.outputs.tag_name }})
+          draft: ${{ steps.tag.outputs.is_draft }}
+          files: |
+            debian.img
+            debian.img.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
