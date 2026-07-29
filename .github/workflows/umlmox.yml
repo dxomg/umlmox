@@ -23,14 +23,10 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install dependencies and latest mmdebstrap from GitHub
+      - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-utils libdpkg-perl genisoimage squashfs-tools curl
-          
-          # Download the correct raw script using refs/heads/master and make it executable
-          sudo curl -o /usr/local/bin/mmdebstrap https://raw.githubusercontent.com/deepin-community/mmdebstrap/refs/heads/master/mmdebstrap
-          sudo chmod +x /usr/local/bin/mmdebstrap
+          sudo apt-get install -y mmdebstrap debian-archive-keyring qemu-utils
 
       - name: Set variables
         id: vars
