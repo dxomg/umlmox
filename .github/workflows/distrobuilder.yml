@@ -1,0 +1,220 @@
+name: Build and Release Debian UML Image
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      hostname:
+        description: 'Hostname for the image'
+        required: true
+        default: 'dxomg'
+      root_password:
+        description: 'Root password for the image'
+        required: true
+        default: 'root'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Distrobuilder & Dependencies
+        run: |
+          sudo apt-get update
+          sudo snap install distrobuilder --classic
+
+      - name: Set variables
+        id: vars
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "HOSTNAME=${{ inputs.hostname }}" >> $GITHUB_ENV
+            echo "ROOT_PASSWORD=${{ inputs.root_password }}" >> $GITHUB_ENV
+          else
+            echo "HOSTNAME=dxomg" >> $GITHUB_ENV
+            echo "ROOT_PASSWORD=root" >> $GITHUB_ENV
+          fi
+
+      - name: Create distrobuilder YAML configuration
+        run: |
+          cat << 'EOF' > debian.yaml
+          image:
+            distribution: "debian"
+            release: "stable"
+            architecture: "x86_64"
+
+          source:
+            downloader: "debootstrap"
+            url: "https://deb.debian.org/debian"
+            keys:
+              - "0x80D7736F52345638"
+
+          targets:
+            type: "raw"
+
+          packages:
+            manager: "apt"
+            sets:
+              - packages:
+                  - iproute2
+                  - netbase
+                  - ifupdown
+                  - iputils-ping
+                  - systemd
+                  - systemd-sysv
+                  - udev
+                  - apt
+                  - ca-certificates
+                  - dbus
+                  - openssh-server
+                  - nano
+                  - wget
+                  - curl
+                  - fastfetch
+                  - e2fsprogs
+
+          files:
+            - path: /etc/hostname
+              generator: template
+              content: |
+                ${{ env.HOSTNAME }}
+
+            - path: /etc/hosts
+              generator: template
+              content: |
+                127.0.0.1    localhost.local
+                10.0.2.15    ${{ env.HOSTNAME }}.local ${{ env.HOSTNAME }}
+
+                ::1          localhost ip6-localhost ip6-loopback
+                ff02::1      ip6-allnodes
+                ff02::2      ip6-allrouters
+
+            - path: /etc/fstab
+              generator: template
+              content: |
+                /dev/ubda    /        ext4    defaults    0 1
+                proc         /proc    proc    defaults    0 0
+                sysfs        /sys     sysfs   defaults    0 0
+                tmpfs        /run     tmpfs   nosuid,nodev,size=50%,mode=755  0 0
+
+            - path: /usr/local/bin/uml-net.sh
+              generator: template
+              mode: 0755
+              content: |
+                #!/bin/sh
+                set -e
+                DNS4="10.0.2.3"
+                DNS6="fec0::3"
+                TIMEOUT=30
+
+                find_iface() {
+                    for _i in $(seq 1 "$TIMEOUT"); do
+                        for dev in vec0 eth0; do
+                            if ip link show "$dev" >/dev/null 2>&1; then echo "$dev"; return 0; fi
+                        done; sleep 1
+                    done; return 1
+                }
+
+                IFACE=$(find_iface) || { echo "[uml-net] ERROR: no vec0 or eth0 after ${TIMEOUT}s" >&2; exit 1; }
+                echo "[uml-net] Found interface: $IFACE"
+                ip link set "$IFACE" up
+
+                # Ensure vmbr0 exists and is up
+                ip link add name vmbr0 type bridge 2>/dev/null || true
+                ip link set vmbr0 up
+
+                case "$IFACE" in
+                    eth0) 
+                        ip link set eth0 master vmbr0 2>/dev/null || true
+                        ip addr add 10.0.2.1/24 dev vmbr0 2>/dev/null || true
+                        ip route replace default dev vmbr0
+                        echo "[uml-net] eth0 (SLIRP/SLIP) bridged to vmbr0: 10.0.2.1/24" ;;
+                    vec0) 
+                        ip link set vec0 master vmbr0 2>/dev/null || true
+                        ip addr add 10.0.2.15/24 dev vmbr0 2>/dev/null || true
+                        ip route replace default via 10.0.2.2 dev vmbr0
+                        ip -6 addr add fec0::15/64 dev vmbr0 2>/dev/null || true
+                        ip -6 route replace default via fec0::2 dev vmbr0
+                        echo "[uml-net] vec0 (VECTOR/VDE) bridged to vmbr0: 10.0.2.15/24 + fec0::15/64" ;;
+                esac
+
+                printf "nameserver %s\nnameserver %s\n" "$DNS4" "$DNS6" > /etc/resolv.conf
+                echo "[uml-net] DNS: $DNS4, $DNS6"
+
+            - path: /etc/systemd/system/uml-net.service
+              generator: template
+              mode: 0644
+              content: |
+                [Unit]
+                Description=UML network auto-config (SLIRP or VDE VECTOR)
+                After=network-pre.target systemd-udevd.service
+                Wants=network-pre.target
+                Before=network.target
+                DefaultDependencies=no
+
+                [Service]
+                Type=oneshot
+                ExecStart=/usr/local/bin/uml-net.sh
+                RemainAfterExit=yes
+
+                [Install]
+                WantedBy=multi-user.target
+
+          actions:
+            - trigger: post-files
+              action: |
+                #!/bin/sh
+                set -e
+
+                # Set root password
+                echo "root:${{ env.ROOT_PASSWORD }}" | chpasswd
+
+                # Enable root SSH login
+                sed -i "s/#PermitRootLogin.*/PermitRootLogin yes/" /etc/ssh/sshd_config || echo "PermitRootLogin yes" >> /etc/ssh/sshd_config
+
+                # Clear MOTD
+                rm -rf /etc/update-motd.d/*
+                true > /etc/motd
+
+                # Create directories
+                mkdir -p /var/lib/vz/images/
+
+                # Enable tty0 console
+                mkdir -p /etc/systemd/system/getty.target.wants
+                ln -sf /lib/systemd/system/getty@.service /etc/systemd/system/getty.target.wants/getty@tty0.service
+
+                # Enable network service
+                systemctl enable uml-net.service
+          EOF
+
+      - name: Build Direct ext4 .img with Distrobuilder
+        run: |
+          sudo distrobuilder build-lxd debian.yaml
+          sudo mv rootfs.img debian.img
+          sudo chown $USER:$USER debian.img
+
+      - name: Determine Release Tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag_name=manual-build-$(date +%Y%m%d-%H%M%S)" >> $GITHUB_OUTPUT
+          else
+            echo "tag_name=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create Release and Upload Asset
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.tag.outputs.tag_name }}
+          name: Debian Stable UML Image (${{ steps.tag.outputs.tag_name }})
+          draft: false
+          files: debian.img
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
