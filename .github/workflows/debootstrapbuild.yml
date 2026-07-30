@@ -1,4 +1,4 @@
-name: Build Proxmox VE
+name: Build and Release Debian PVE Image
 
 on:
   workflow_dispatch:
@@ -13,6 +13,9 @@ on:
         required: true
         default: 'root'
         type: string
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -128,9 +131,15 @@ jobs:
 
           echo "Build complete! Image created at debian.img"
 
-      - name: Upload Debian Image Artifact
-        uses: actions/upload-artifact@v4
+      - name: Create Release and Upload Asset
+        uses: softprops/action-gh-release@v2
         with:
-          name: debian-pve-img
-          path: debian.img
-          compression-level: 6
+          files: debian.img
+          tag_name: debian-pve-${{ github.run_number }}
+          name: Debian Trixie PVE Image (Run #${{ github.run_number }})
+          body: |
+            Automated Debian Trixie Proxmox VE (PVE) rootfs image build.
+            - **Hostname:** `${{ inputs.hostname }}`
+            - **GitHub Run ID:** `${{ github.run_id }}`
+          draft: false
+          prerelease: false
