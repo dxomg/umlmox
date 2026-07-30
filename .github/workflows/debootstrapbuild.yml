@@ -37,9 +37,9 @@ jobs:
         run: |
           set -e
 
-          # Use environment variables instead of interactive prompts
-          HOSTNAME="${INPUT_HOSTNAME:-dxomg}"
-          PASSWORD="${INPUT_PASSWORD:-rootpassword123}"
+          # Use environment variables with updated defaults
+          HOSTNAME="${INPUT_HOSTNAME:-pve}"
+          PASSWORD="${INPUT_PASSWORD:-root}"
 
           MNTDIR="./debian_root"
           IMG="debian.img"
@@ -55,6 +55,21 @@ jobs:
             trixie \
             "$MNTDIR" \
             http://deb.debian.org/debian
+
+          # Mount virtual filesystems required for chroot and systemd operations
+          sudo mount -t proc proc "$MNTDIR/proc"
+          sudo mount --bind /sys "$MNTDIR/sys"
+          sudo mount --bind /dev "$MNTDIR/dev"
+          sudo mount --bind /dev/pts "$MNTDIR/dev/pts"
+
+          # Ensure unmounting happens safely on exit/error
+          cleanup() {
+            sudo umount "$MNTDIR/dev/pts" 2>/dev/null || true
+            sudo umount "$MNTDIR/dev" 2>/dev/null || true
+            sudo umount "$MNTDIR/sys" 2>/dev/null || true
+            sudo umount "$MNTDIR/proc" 2>/dev/null || true
+          }
+          trap cleanup EXIT
 
           # Apply configurations inside the chroot environment
           echo "root:$PASSWORD" | sudo chroot "$MNTDIR" chpasswd
@@ -117,6 +132,12 @@ jobs:
 
           sudo chroot "$MNTDIR" rm -f /usr/sbin/policy-rc.d
           sudo chroot "$MNTDIR" apt-get clean && sudo chroot "$MNTDIR" rm -rf /var/lib/apt/lists/*
+
+          # Unmount virtual filesystems before creating the disk image
+          sudo umount "$MNTDIR/dev/pts" || true
+          sudo umount "$MNTDIR/dev" || true
+          sudo umount "$MNTDIR/sys" || true
+          sudo umount "$MNTDIR/proc" || true
 
           # Package staging directory into the final ext4 disk image (debian.img)
           echo "Creating final ext4 disk image (debian.img)..."
