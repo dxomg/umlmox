@@ -28,7 +28,7 @@ jobs:
       - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y debootstrap coreutils util-linux wget
+          sudo apt-get install -y debootstrap coreutils util-linux wget xz-utils
 
       - name: Build Rootfs and Disk Image
         env:
@@ -45,7 +45,7 @@ jobs:
           IMG="debian.img"
 
           # Clean up any previous staging directory or image
-          sudo rm -rf "$MNTDIR" "$IMG"
+          sudo rm -rf "$MNTDIR" "$IMG" "$IMG.xz"
 
           # Run debootstrap to populate the rootfs directory
           sudo debootstrap \
@@ -129,17 +129,23 @@ jobs:
           rmdir "$TMPMOUNT"
           sudo rm -rf "$MNTDIR"
 
-          echo "Build complete! Image created at debian.img"
+          # Compress image using multi-threaded xz to stay safely below GitHub asset limits
+          echo "Compressing disk image..."
+          xz -T0 "$IMG"
+
+          echo "Build and compression complete!"
 
       - name: Create Release and Upload Asset
         uses: softprops/action-gh-release@v2
         with:
-          files: debian.img
+          files: debian.img.xz
           tag_name: debian-pve-${{ github.run_number }}
           name: Debian Trixie PVE Image (Run #${{ github.run_number }})
           body: |
             Automated Debian Trixie Proxmox VE (PVE) rootfs image build.
             - **Hostname:** `${{ inputs.hostname }}`
             - **GitHub Run ID:** `${{ github.run_id }}`
+            
+            *Note: The asset is compressed (`.img.xz`). Decompress it before use with: `xz -d debian.img.xz`*
           draft: false
           prerelease: false
