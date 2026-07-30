@@ -53,7 +53,7 @@ jobs:
           sudo debootstrap \
             --variant=minbase \
             --components="main,contrib,non-free-firmware" \
-            --include=iproute2,netbase,ifupdown,iputils-ping,systemd,systemd-sysv,udev,apt,ca-certificates,dbus,openssh-server,nano,wget,curl,fastfetch \
+            --include=iproute2,netbase,ifupdown,iputils-ping,systemd,systemd-sysv,udev,apt,ca-certificates,dbus,openssh-server,nano,wget,curl,fastfetch,e2fsprogs \
             trixie \
             "$MNTDIR" \
             http://deb.debian.org/debian
