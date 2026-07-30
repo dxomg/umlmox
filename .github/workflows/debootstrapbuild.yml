@@ -74,7 +74,8 @@ jobs:
           # Apply configurations inside the chroot environment
           echo "root:$PASSWORD" | sudo chroot "$MNTDIR" chpasswd
           echo "$HOSTNAME" | sudo chroot "$MNTDIR" tee /etc/hostname >/dev/null
-          printf "127.0.0.1 localhost localhost.local\n::1 localhost ip6-localhost ip6-loopback\n10.0.2.15 %s.local %s\n10.0.2.1 %s.local %s\n" "$HOSTNAME" "$HOSTNAME" "$HOSTNAME" "$HOSTNAME" | sudo chroot "$MNTDIR" tee /etc/hosts >/dev/null
+          
+          printf "127.0.0.1 localhost localhost.local %s %s.local\n::1 localhost ip6-localhost ip6-loopback\n10.0.2.15 %s.local %s\n" "$HOSTNAME" "$HOSTNAME" "$HOSTNAME" "$HOSTNAME" | sudo chroot "$MNTDIR" tee /etc/hosts >/dev/null
 
           sudo chroot "$MNTDIR" sed -i "s/#PermitRootLogin.*/PermitRootLogin yes/" /etc/ssh/sshd_config
           sudo chroot "$MNTDIR" rm -rf /etc/update-motd.d/*
@@ -84,10 +85,75 @@ jobs:
 
           sudo chroot "$MNTDIR" systemctl enable getty@tty0.service
 
-          # Write uml-net script and service inside chroot
-          sudo chroot "$MNTDIR" sh -c 'printf '\''#!/bin/sh\nset -e\nDNS4="10.0.2.3"\nDNS6="fec0::3"\nTIMEOUT=30\nfind_iface() {\n    for _i in $(seq 1 "$TIMEOUT"); do\n        for dev in vec0 eth0;\n            do if ip link show "$dev" >/dev/null 2>&1; then echo "$dev"; return 0; fi\n        done; sleep 1\n    done; return 1\n}\nIFACE=$(find_iface) || { echo "[uml-net] ERROR: no vec0 or eth0 after ${TIMEOUT}s" >&2; exit 1; }\necho "[uml-net] Found interface: $IFACE"\nip link set "$IFACE" up\nip link add name vmbr0 type bridge 2>/dev/null || true\nip link set vmbr0 up\ncase "$IFACE" in\n    eth0)  \n          ip link set eth0 master vmbr0 2>/dev/null || true\n          ip addr add 10.0.2.1/24 dev vmbr0 2>/dev/null || true\n          ip route replace default dev vmbr0\n          echo "[uml-net] eth0 (SLIRP/SLIP) bridged to vmbr0: 10.0.2.1/24" ;;\n    vec0)  \n          ip link set vec0 master vmbr0 2>/dev/null || true\n          ip addr add 10.0.2.15/24 dev vmbr0 2>/dev/null || true\n          ip route replace default via 10.0.2.2 dev vmbr0\n          ip -6 addr add fec0::15/64 dev vmbr0 2>/dev/null || true\n          ip -6 route replace default via fec0::2 dev vmbr0\n          echo "[uml-net] vec0 (VECTOR/VDE) bridged to vmbr0: 10.0.2.15/24 + fec0::15/64" ;;\nesac\nprintf "nameserver %s\\nnameserver %s\\n" "$DNS4" "$DNS6" > /etc/resolv.conf\necho "[uml-net] DNS: $DNS4, $DNS6"\n'\'' > /usr/local/bin/uml-net.sh && chmod +x /usr/local/bin/uml-net.sh'
+          # Write uml-net script inside chroot using a clean heredoc
+          sudo chroot "$MNTDIR" sh -c 'cat << '\''EOF'\'' > /usr/local/bin/uml-net.sh
+          #!/bin/sh
+          set -e
+          DNS4="10.0.2.3"
+          DNS6="fec0::3"
+          TIMEOUT=30
 
-          sudo chroot "$MNTDIR" sh -c 'printf '\''[Unit]\nDescription=UML network auto-config (SLIRP or VDE VECTOR)\nAfter=network-pre.target systemd-udevd.service\nWants=network-pre.target\nBefore=network.target\nDefaultDependencies=no\n[Service]\nType=oneshot\nExecStart=/usr/local/bin/uml-net.sh\nRemainAfterExit=yes\n[Install]\nWantedBy=multi-user.target\n'\'' > /etc/systemd/system/uml-net.service'
+          find_iface() {
+              for _i in $(seq 1 "$TIMEOUT"); do
+                  for dev in vec0 eth0; do
+                      if ip link show "$dev" >/dev/null 2>&1; then
+                          echo "$dev"
+                          return 0
+                      fi
+                  done
+                  sleep 1
+              done
+              return 1
+          }
+
+          IFACE=$(find_iface) || { echo "[uml-net] ERROR: no vec0 or eth0 after ${TIMEOUT}s" >&2; exit 1; }
+          echo "[uml-net] Found interface: $IFACE"
+          ip link set "$IFACE" up
+          ip link add name vmbr0 type bridge 2>/dev/null || true
+          ip link set vmbr0 up
+
+          case "$IFACE" in
+              eth0)  
+                    ip link set eth0 master vmbr0 2>/dev/null || true
+                    ip addr add 10.0.2.1/24 dev vmbr0 2>/dev/null || true
+                    ip route replace default dev vmbr0
+                    echo "[uml-net] eth0 (SLIRP/SLIP) bridged to vmbr0: 10.0.2.1/24"
+                    ;;
+              vec0)  
+                    ip link set vec0 master vmbr0 2>/dev/null || true
+                    ip addr add 10.0.2.15/24 dev vmbr0 2>/dev/null || true
+                    ip route replace default via 10.0.2.2 dev vmbr0
+                    ip -6 addr add fec0::15/64 dev vmbr0 2>/dev/null || true
+                    ip -6 route replace default via fec0::2 dev vmbr0
+                    echo "[uml-net] vec0 (VECTOR/VDE) bridged to vmbr0: 10.0.2.15/24 + fec0::15/64"
+                    ;;
+          esac
+
+          echo "nameserver $DNS4" > /etc/resolv.conf
+          echo "nameserver $DNS6" >> /etc/resolv.conf
+          echo "[uml-net] DNS: $DNS4, $DNS6"
+          EOF
+          chmod +x /usr/local/bin/uml-net.sh
+          '
+
+          # Write systemd service file inside chroot using a clean heredoc
+          sudo chroot "$MNTDIR" sh -c 'cat << '\''EOF'\'' > /etc/systemd/system/uml-net.service
+          [Unit]
+          Description=UML network auto-config (SLIRP or VDE VECTOR)
+          After=network-pre.target systemd-udevd.service
+          Wants=network-pre.target
+          Before=network.target
+          DefaultDependencies=no
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/bin/uml-net.sh
+          RemainAfterExit=yes
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+          '
 
           sudo chroot "$MNTDIR" systemctl enable uml-net.service
 
@@ -116,11 +182,15 @@ jobs:
           sudo env DEBIAN_FRONTEND=noninteractive chroot "$MNTDIR" apt-get install -y --no-install-recommends proxmox-ve postfix open-iscsi chrony
           sudo env DEBIAN_FRONTEND=noninteractive chroot "$MNTDIR" apt-get remove -y os-prober
 
+          # Reinstall UI and font packages to prevent missing CSS/Font assets
+          sudo env DEBIAN_FRONTEND=noninteractive chroot "$MNTDIR" apt-get install --reinstall -y libjs-extjs fonts-font-awesome pve-manager proxmox-widget-toolkit
+
           sudo chroot "$MNTDIR" rm -f /etc/apt/sources.list.d/pve-enterprise.list /etc/apt/sources.list.d/pve-enterprise.sources /etc/apt/sources.list.d/ceph.list /etc/apt/sources.list.d/ceph.sources
           sudo chroot "$MNTDIR" rm -rf /usr/lib/modules /boot /usr/lib/firmware
           sudo chroot "$MNTDIR" rm -f /usr/lib/x86_64-linux-gnu/libLLVM*.so* /usr/lib/x86_64-linux-gnu/libgallium*.so* /usr/lib/x86_64-linux-gnu/libvulkan_*.so* /usr/lib/x86_64-linux-gnu/libz3.so* /usr/lib/x86_64-linux-gnu/libx265.so* /usr/lib/x86_64-linux-gnu/libcodec2.so* /usr/lib/x86_64-linux-gnu/libavcodec.so* /usr/lib/x86_64-linux-gnu/libavfilter.so* /usr/lib/x86_64-linux-gnu/libSvtAv1Enc.so* /usr/lib/x86_64-linux-gnu/libplacebo.so*
           sudo chroot "$MNTDIR" rm -rf /usr/lib/x86_64-linux-gnu/dri /usr/lib/x86_64-linux-gnu/gstreamer-1.0
-          sudo chroot "$MNTDIR" rm -rf /usr/share/pocketsphinx /usr/share/X11 /usr/share/alsa /usr/share/fonts /usr/share/grub /usr/share/groff /usr/share/mime /usr/share/doc /usr/share/man
+          # Preserved /usr/share/fonts to keep FontAwesome icons working properly
+          sudo chroot "$MNTDIR" rm -rf /usr/share/pocketsphinx /usr/share/X11 /usr/share/alsa /usr/share/grub /usr/share/groff /usr/share/mime /usr/share/man
 
           sudo chroot "$MNTDIR" ln -sf ifupdown2 /usr/share/ifupdown2/ifreload
           printf '#!/bin/sh\ncase "$1" in\n  -V|--version)\n    exec /usr/share/ifupdown2/ifreload -V\n    ;;\nesac\nexit 0\n' | sudo chroot "$MNTDIR" tee /usr/sbin/ifreload >/dev/null
