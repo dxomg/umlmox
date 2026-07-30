@@ -1,359 +1,136 @@
-name: Build and Release Minimal Proxmox-VE UML Image
+name: Build Proxmox VE
 
 on:
-  push:
-    tags:
-      - 'v*'
   workflow_dispatch:
     inputs:
       hostname:
-        description: 'Hostname for the image'
+        description: 'Enter hostname (e.g., pve)'
         required: true
-        default: 'pve-uml'
-      root_password:
-        description: 'Root password for the image'
+        default: 'pve'
+        type: string
+      password:
+        description: 'Enter root password'
         required: true
         default: 'root'
-
-permissions:
-  contents: write
+        type: string
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
 
-      - name: Install dependencies
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y debootstrap debian-archive-keyring qemu-utils e2fsprogs wget ca-certificates zerofree xz-utils
+          sudo apt-get install -y debootstrap coreutils util-linux wget
 
-      - name: Set variables
-        id: vars
+      - name: Build Rootfs and Disk Image
+        env:
+          INPUT_HOSTNAME: ${{ inputs.hostname }}
+          INPUT_PASSWORD: ${{ inputs.password }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "HOSTNAME=${{ inputs.hostname }}" >> $GITHUB_ENV
-            echo "ROOT_PASSWORD=${{ inputs.root_password }}" >> $GITHUB_ENV
-          else
-            echo "HOSTNAME=pve-uml" >> $GITHUB_ENV
-            echo "ROOT_PASSWORD=root" >> $GITHUB_ENV
-          fi
+          set -e
 
-      - name: Build Minimal Proxmox VE Image
-        run: |
-          # 1. Create a sparse 1.5GB raw image (only allocates used space)
-          truncate -s 1500M debian.img
-          mkfs.ext4 -F -m 0 -E discard debian.img
-          
-          # 2. Mount the image
-          mkdir -p mnt
-          sudo mount -o loop,discard debian.img mnt
-          
-          # 3. Run debootstrap with minimal base and heavy exclusions
+          # Use environment variables instead of interactive prompts
+          HOSTNAME="${INPUT_HOSTNAME:-dxomg}"
+          PASSWORD="${INPUT_PASSWORD:-rootpassword123}"
+
+          MNTDIR="./debian_root"
+          IMG="debian.img"
+
+          # Clean up any previous staging directory or image
+          sudo rm -rf "$MNTDIR" "$IMG"
+
+          # Run debootstrap to populate the rootfs directory
           sudo debootstrap \
             --variant=minbase \
             --components="main,contrib,non-free-firmware" \
-            --include=iproute2,netbase,ifupdown,iputils-ping,systemd,systemd-sysv,udev,apt,ca-certificates,dbus,openssh-server,wget,curl,e2fsprogs,libterm-readline-gnu-perl \
-            --exclude=aptitude,tasksel,installation-report,discover,os-prober,laptop-detect,usbutils,pciutils,wireless-tools,wpasupplicant,ppp,pppoeconf,libsasl2-modules,libx11-data,xkb-data,iw,crda,firmware-linux-free,firmware-misc-nonfree,firmware-realtek,firmware-atheros,firmware-brcm80211,firmware-iwlwifi,firmware-libertas,firmware-ti-connectivity,firmware-zd1211,amd64-microcode,intel-microcode,iucode-tool \
-            trixie mnt http://deb.debian.org/debian
-          
-          # 4. Mount pseudo-filesystems 
-          sudo mount -t proc none mnt/proc
-          sudo mount -t sysfs none mnt/sys
-          sudo mount -o bind /dev mnt/dev
-          
-          # 5. Chroot and setup
-          sudo chroot mnt /bin/bash << 'EOF'
-          export DEBIAN_FRONTEND=noninteractive
-          set -e
+            --include=iproute2,netbase,ifupdown,iputils-ping,systemd,systemd-sysv,udev,apt,ca-certificates,dbus,openssh-server,nano,wget,curl,fastfetch \
+            trixie \
+            "$MNTDIR" \
+            http://deb.debian.org/debian
 
-          # Set root password
-          echo "root:${{ env.ROOT_PASSWORD }}" | chpasswd
+          # Apply configurations inside the chroot environment
+          echo "root:$PASSWORD" | sudo chroot "$MNTDIR" chpasswd
+          echo "$HOSTNAME" | sudo chroot "$MNTDIR" tee /etc/hostname >/dev/null
+          printf "127.0.0.1 localhost localhost.local\n::1 localhost ip6-localhost ip6-loopback\n10.0.2.15 %s.local %s\n10.0.2.1 %s.local %s\n" "$HOSTNAME" "$HOSTNAME" "$HOSTNAME" "$HOSTNAME" | sudo chroot "$MNTDIR" tee /etc/hosts >/dev/null
 
-          # Enable root SSH login
-          sed -i 's/#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+          sudo chroot "$MNTDIR" sed -i "s/#PermitRootLogin.*/PermitRootLogin yes/" /etc/ssh/sshd_config
+          sudo chroot "$MNTDIR" rm -rf /etc/update-motd.d/*
+          sudo chroot "$MNTDIR" sh -c "true > /etc/motd"
 
-          # Clear MOTD & Logs
-          rm -rf /etc/update-motd.d/*
-          true > /etc/motd
-          true > /var/log/bootstrap.log
-          true > /var/log/dpkg.log
+          printf "/dev/ubda    /        ext4    defaults    0 1\nproc        /proc    proc    defaults    0 0\nsysfs       /sys    sysfs   defaults    0 0\ntmpfs       /run    tmpfs   nosuid,nodev,size=50%%,mode=755  0 0\n" | sudo chroot "$MNTDIR" tee /etc/fstab >/dev/null
 
-          # Create required paths
-          mkdir -p /var/lib/vz/images/
-          mkdir -p /usr/share/doc/pve-manager
-          touch /usr/share/doc/pve-manager/aplinfo.dat
+          sudo chroot "$MNTDIR" systemctl enable getty@tty0.service
 
-          # Set Hostname
-          echo "${{ env.HOSTNAME }}" > /etc/hostname
+          # Write uml-net script and service inside chroot
+          sudo chroot "$MNTDIR" sh -c 'printf '\''#!/bin/sh\nset -e\nDNS4="10.0.2.3"\nDNS6="fec0::3"\nTIMEOUT=30\nfind_iface() {\n    for _i in $(seq 1 "$TIMEOUT"); do\n        for dev in vec0 eth0;\n            do if ip link show "$dev" >/dev/null 2>&1; then echo "$dev"; return 0; fi\n        done; sleep 1\n    done; return 1\n}\nIFACE=$(find_iface) || { echo "[uml-net] ERROR: no vec0 or eth0 after ${TIMEOUT}s" >&2; exit 1; }\necho "[uml-net] Found interface: $IFACE"\nip link set "$IFACE" up\nip link add name vmbr0 type bridge 2>/dev/null || true\nip link set vmbr0 up\ncase "$IFACE" in\n    eth0)  \n          ip link set eth0 master vmbr0 2>/dev/null || true\n          ip addr add 10.0.2.1/24 dev vmbr0 2>/dev/null || true\n          ip route replace default dev vmbr0\n          echo "[uml-net] eth0 (SLIRP/SLIP) bridged to vmbr0: 10.0.2.1/24" ;;\n    vec0)  \n          ip link set vec0 master vmbr0 2>/dev/null || true\n          ip addr add 10.0.2.15/24 dev vmbr0 2>/dev/null || true\n          ip route replace default via 10.0.2.2 dev vmbr0\n          ip -6 addr add fec0::15/64 dev vmbr0 2>/dev/null || true\n          ip -6 route replace default via fec0::2 dev vmbr0\n          echo "[uml-net] vec0 (VECTOR/VDE) bridged to vmbr0: 10.0.2.15/24 + fec0::15/64" ;;\nesac\nprintf "nameserver %s\\nnameserver %s\\n" "$DNS4" "$DNS6" > /etc/resolv.conf\necho "[uml-net] DNS: $DNS4, $DNS6"\n'\'' > /usr/local/bin/uml-net.sh && chmod +x /usr/local/bin/uml-net.sh'
 
-          # Configure /etc/hosts
-          cat << 'HOSTS' > /etc/hosts
-          127.0.0.1    localhost.local
-          10.0.2.15    ${{ env.HOSTNAME }}.local ${{ env.HOSTNAME }}
-          ::1        localhost ip6-localhost ip6-loopback
-          HOSTS
+          sudo chroot "$MNTDIR" sh -c 'printf '\''[Unit]\nDescription=UML network auto-config (SLIRP or VDE VECTOR)\nAfter=network-pre.target systemd-udevd.service\nWants=network-pre.target\nBefore=network.target\nDefaultDependencies=no\n[Service]\nType=oneshot\nExecStart=/usr/local/bin/uml-net.sh\nRemainAfterExit=yes\n[Install]\nWantedBy=multi-user.target\n'\'' > /etc/systemd/system/uml-net.service'
 
-          # Configure /etc/fstab for UML
-          cat << 'FSTAB' > /etc/fstab
-          /dev/ubda    /       ext4    defaults,discard    0 1
-          proc        /proc   proc    defaults    0 0
-          sysfs       /sys    sysfs   defaults    0 0
-          tmpfs       /run    tmpfs   nosuid,nodev,size=50%,mode=755  0 0
-          FSTAB
+          sudo chroot "$MNTDIR" systemctl enable uml-net.service
 
-          # Minimize apt behavior
-          cat << 'APTCNF' > /etc/apt/apt.conf.d/99minimal
-          APT::Install-Recommends "0";
-          APT::Install-Suggests "0";
-          APT::Get::Assume-Yes "true";
-          APT::Get::Clean "always";
-          APT::Acquire::Retries "3";
-          APT::Periodic::Enable "0";
-          APT::Get::List-Cleanup "true";
-          APTCNF
+          # Proxmox repository setup
+          sudo chroot "$MNTDIR" wget https://enterprise.proxmox.com/debian/proxmox-archive-keyring-trixie.gpg -O /usr/share/keyrings/proxmox-archive-keyring.gpg
+          printf "Types: deb\nURIs: http://download.proxmox.com/debian/pve\nSuites: trixie\nComponents: pve-no-subscription\nSigned-By: /usr/share/keyrings/proxmox-archive-keyring.gpg\n" | sudo chroot "$MNTDIR" tee /etc/apt/sources.list.d/pve-install-repo.sources >/dev/null
 
-          # Exclude docs/man pages/locales from ALL future dpkg installs
-          cat << 'DPKG' > /etc/dpkg/dpkg.cfg.d/99-exclude
-          path-exclude=/usr/share/man/*
-          path-include=/usr/share/man/man[1-9]/*
-          path-exclude=/usr/share/locale/*
-          path-include=/usr/share/locale/locale.alias
-          path-exclude=/usr/share/doc/*
-          path-include=/usr/share/doc/*/copyright
-          path-include=/usr/share/doc/*/changelog.Debian.*
-          path-exclude=/usr/share/groff/*
-          path-exclude=/usr/share/info/*
-          path-exclude=/usr/share/lintian/*
-          path-exclude=/usr/share/common-licenses/*
-          DPKG
+          # Package management hooks
+          printf "#!/bin/sh\nexit 101\n" | sudo chroot "$MNTDIR" tee /usr/sbin/policy-rc.d >/dev/null
+          sudo chroot "$MNTDIR" chmod +x /usr/sbin/policy-rc.d
 
-          # Add Proxmox archive keyring
-          wget -q https://enterprise.proxmox.com/debian/proxmox-archive-keyring-trixie.gpg \
-            -O /usr/share/keyrings/proxmox-archive-keyring.gpg && \
-            echo "136673be77aba35dcce385b28737689ad64fd785a797e57897589aed08db6e45  /usr/share/keyrings/proxmox-archive-keyring.gpg" | sha256sum -c -
+          sudo chroot "$MNTDIR" dpkg-divert --local --rename --add /usr/bin/unshare
+          printf "#!/bin/sh\nwhile [ \$# -gt 0 ] && [ \"\$1\" != \"--\" ]; do shift; done\n[ \"\$1\" = \"--\" ] && shift\n[ \$# -gt 0 ] && exec \"\$@\"\nexit 0\n" | sudo chroot "$MNTDIR" tee /usr/bin/unshare >/dev/null
+          sudo chroot "$MNTDIR" chmod +x /usr/bin/unshare
 
-          # Add Proxmox VE no-subscription repository
-          printf 'Types: deb\nURIs: http://download.proxmox.com/debian/pve\nSuites: trixie\nComponents: pve-no-subscription\nSigned-By: /usr/share/keyrings/proxmox-archive-keyring.gpg\n' \
-            > /etc/apt/sources.list.d/pve-install-repo.sources
+          sudo chroot "$MNTDIR" dpkg-divert --local --rename --add /usr/sbin/update-initramfs
+          printf "#!/bin/sh\nexit 0\n" | sudo chroot "$MNTDIR" tee /usr/sbin/update-initramfs >/dev/null
+          sudo chroot "$MNTDIR" chmod +x /usr/sbin/update-initramfs
 
-          # Prevent services from starting during install
-          printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d && chmod +x /usr/sbin/policy-rc.d
+          sudo chroot "$MNTDIR" dpkg-divert --local --rename --add /usr/sbin/ifreload
+          sudo chroot "$MNTDIR" mkdir -p /usr/share/doc/pve-manager
+          sudo chroot "$MNTDIR" sh -c "touch /usr/share/doc/pve-manager/aplinfo.dat"
+          printf "Package: ifupdown2\nPin: origin download.proxmox.com\nPin-Priority: 1001\n" | sudo chroot "$MNTDIR" tee /etc/apt/preferences.d/proxmox-ifupdown2 >/dev/null
 
-          # Stub unavailable commands / diverts
-          dpkg-divert --local --rename --add /usr/bin/unshare && \
-            printf '#!/bin/sh\nwhile [ $# -gt 0 ] && [ "$1" != "--" ]; do shift; done\n[ "$1" = "--" ] && shift\n[ $# -gt 0 ] && exec "$@"\nexit 0\n' \
-              > /usr/bin/unshare && chmod +x /usr/bin/unshare && \
-            dpkg-divert --local --rename --add /usr/sbin/update-initramfs && \
-            printf '#!/bin/sh\nexit 0\n' > /usr/sbin/update-initramfs && chmod +x /usr/sbin/update-initramfs && \
-            dpkg-divert --local --rename --add /usr/sbin/ifreload && \
-            printf '#!/bin/sh\nexit 0\n' > /usr/sbin/ifreload && chmod +x /usr/sbin/ifreload && \
-            printf '#!/bin/sh\nexit 0\n' > /usr/local/sbin/systemctl && chmod +x /usr/local/sbin/systemctl
+          sudo env DEBIAN_FRONTEND=noninteractive chroot "$MNTDIR" apt-get update
+          sudo env DEBIAN_FRONTEND=noninteractive chroot "$MNTDIR" apt-get install -y --no-install-recommends proxmox-ve postfix open-iscsi chrony
+          sudo env DEBIAN_FRONTEND=noninteractive chroot "$MNTDIR" apt-get remove -y os-prober
 
-          # Pin ifupdown2
-          printf 'Package: ifupdown2\nPin: origin download.proxmox.com\nPin-Priority: 1001\n' \
-            > /etc/apt/preferences.d/proxmox-ifupdown2
+          sudo chroot "$MNTDIR" rm -f /etc/apt/sources.list.d/pve-enterprise.list /etc/apt/sources.list.d/pve-enterprise.sources /etc/apt/sources.list.d/ceph.list /etc/apt/sources.list.d/ceph.sources
+          sudo chroot "$MNTDIR" rm -rf /usr/lib/modules /boot /usr/lib/firmware
+          sudo chroot "$MNTDIR" rm -f /usr/lib/x86_64-linux-gnu/libLLVM*.so* /usr/lib/x86_64-linux-gnu/libgallium*.so* /usr/lib/x86_64-linux-gnu/libvulkan_*.so* /usr/lib/x86_64-linux-gnu/libz3.so* /usr/lib/x86_64-linux-gnu/libx265.so* /usr/lib/x86_64-linux-gnu/libcodec2.so* /usr/lib/x86_64-linux-gnu/libavcodec.so* /usr/lib/x86_64-linux-gnu/libavfilter.so* /usr/lib/x86_64-linux-gnu/libSvtAv1Enc.so* /usr/lib/x86_64-linux-gnu/libplacebo.so*
+          sudo chroot "$MNTDIR" rm -rf /usr/lib/x86_64-linux-gnu/dri /usr/lib/x86_64-linux-gnu/gstreamer-1.0
+          sudo chroot "$MNTDIR" rm -rf /usr/share/pocketsphinx /usr/share/X11 /usr/share/alsa /usr/share/fonts /usr/share/grub /usr/share/groff /usr/share/mime /usr/share/doc /usr/share/man
 
-          # Install Proxmox VE (metapackage — then aggressively prune like dockermox)
-          apt-get update && \
-            apt-get full-upgrade -y && \
-            apt-get install -y --no-install-recommends \
-              proxmox-ve \
-              postfix \
-              open-iscsi \
-              chrony && \
-            apt-get remove -y --purge os-prober || true
+          sudo chroot "$MNTDIR" ln -sf ifupdown2 /usr/share/ifupdown2/ifreload
+          printf '#!/bin/sh\ncase "$1" in\n  -V|--version)\n    exec /usr/share/ifupdown2/ifreload -V\n    ;;\nesac\nexit 0\n' | sudo chroot "$MNTDIR" tee /usr/sbin/ifreload >/dev/null
+          sudo chroot "$MNTDIR" chmod +x /usr/sbin/ifreload
 
-          # Remove enterprise and ceph repos
-          rm -f /etc/apt/sources.list.d/pve-enterprise.list \
-                /etc/apt/sources.list.d/pve-enterprise.sources \
-                /etc/apt/sources.list.d/ceph.list \
-                /etc/apt/sources.list.d/ceph.sources
+          printf '[Unit]\nDescription=FUSE filesystem for LXC\nBefore=lxc.service\nDocumentation=man:lxcfs(1)\n\n[Service]\nOOMScoreAdjust=-1000\nExecStartPre=/bin/mkdir -p /var/lib/lxcfs\nExecStart=/usr/bin/lxcfs /var/lib/lxcfs\nKillMode=process\nRestart=on-failure\nExecStopPost=-/bin/fusermount -u /var/lib/lxcfs\nDelegate=yes\nExecReload=/bin/kill -USR1 $MAINPID\n[Install]\nWantedBy=multi-user.target\n' | sudo chroot "$MNTDIR" tee /lib/systemd/system/lxcfs.service >/dev/null
+          sudo chroot "$MNTDIR" mkdir -p /usr/share/lxc/config/common.conf.d
+          echo "lxc.apparmor.profile = unconfined" | sudo chroot "$MNTDIR" tee /usr/share/lxc/config/common.conf.d/99-fix-apparmor.conf >/dev/null
 
-          # Fix ifreload for Proxmox GUI check
-          ln -sf ifupdown2 /usr/share/ifupdown2/ifreload && \
-            printf '#!/bin/sh\ncase "$1" in\n  -V|--version)\n    exec /usr/share/ifupdown2/ifreload -V\n    ;;\nesac\nexit 0\n' \
-              > /usr/sbin/ifreload && chmod +x /usr/sbin/ifreload
+          sudo chroot "$MNTDIR" rm -f /usr/sbin/policy-rc.d
+          sudo chroot "$MNTDIR" apt-get clean && sudo chroot "$MNTDIR" rm -rf /var/lib/apt/lists/*
 
-          # Patch lxcfs service definition
-          printf '[Unit]\nDescription=FUSE filesystem for LXC\nBefore=lxc.service\nDocumentation=man:lxcfs(1)\n\n[Service]\nOOMScoreAdjust=-1000\nExecStartPre=/bin/mkdir -p /var/lib/lxcfs\nExecStart=/usr/bin/lxcfs /var/lib/lxcfs\nKillMode=process\nRestart=on-failure\nExecStopPost=-/bin/fusermount -u /var/lib/lxcfs\nDelegate=yes\nExecReload=/bin/kill -USR1 $MAINPID\n[Install]\nWantedBy=multi-user.target\n' > /lib/systemd/system/lxcfs.service
+          # Package staging directory into the final ext4 disk image (debian.img)
+          echo "Creating final ext4 disk image (debian.img)..."
+          fallocate -l 1.7G "$IMG"
+          mkfs.ext4 -F "$IMG"
+          TMPMOUNT=$(mktemp -d)
+          sudo mount "$IMG" "$TMPMOUNT"
+          sudo cp -a "$MNTDIR"/. "$TMPMOUNT"/
+          sudo umount "$TMPMOUNT"
+          rmdir "$TMPMOUNT"
+          sudo rm -rf "$MNTDIR"
 
-          # Disable AppArmor for LXC containers
-          mkdir -p /usr/share/lxc/config/common.conf.d/
-          echo "lxc.apparmor.profile = unconfined" > /usr/share/lxc/config/common.conf.d/99-fix-apparmor.conf
+          echo "Build complete! Image created at debian.img"
 
-          # ============================================
-          # AGGRESSIVE CLEANUP (adapted from dockermox)
-          # ============================================
-
-          # Remove kernel modules and boot files — useless in UML (~960 MB)
-          rm -rf /usr/lib/modules /boot
-
-          # Remove hardware firmware blobs — no physical hardware in UML (~520 MB)
-          rm -rf /usr/lib/firmware
-
-          # Remove GPU/display/media libs — no display server, no GPU passthrough
-          rm -f \
-            /usr/lib/x86_64-linux-gnu/libLLVM*.so* \
-            /usr/lib/x86_64-linux-gnu/libgallium*.so* \
-            /usr/lib/x86_64-linux-gnu/libvulkan_*.so* \
-            /usr/lib/x86_64-linux-gnu/libz3.so* \
-            /usr/lib/x86_64-linux-gnu/libx265.so* \
-            /usr/lib/x86_64-linux-gnu/libcodec2.so* \
-            /usr/lib/x86_64-linux-gnu/libavcodec.so* \
-            /usr/lib/x86_64-linux-gnu/libavfilter.so* \
-            /usr/lib/x86_64-linux-gnu/libSvtAv1Enc.so* \
-            /usr/lib/x86_64-linux-gnu/libplacebo.so*
-          rm -rf \
-            /usr/lib/x86_64-linux-gnu/dri \
-            /usr/lib/x86_64-linux-gnu/gstreamer-1.0
-
-          # Remove share assets not needed at runtime
-          rm -rf \
-            /usr/share/pocketsphinx \
-            /usr/share/X11 \
-            /usr/share/alsa \
-            /usr/share/fonts \
-            /usr/share/grub \
-            /usr/share/groff \
-            /usr/share/mime \
-            /usr/share/doc \
-            /usr/share/man \
-            /usr/share/info \
-            /usr/share/lintian \
-            /usr/share/common-licenses
-
-          # Keep minimal placeholders for dpkg compatibility
-          mkdir -p /usr/share/locale && touch /usr/share/locale/locale.alias
-          mkdir -p /usr/share/doc && touch /usr/share/doc/.placeholder
-
-          # Remove heavy Proxmox docs/i18n if present
-          apt-get remove -y --purge pve-docs pve-i18n || true
-
-          # Final apt cleanup
-          apt-get autoremove -y --purge
-          apt-get clean
-          rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* /tmp/* /var/tmp/*
-
-          # Remove logs
-          find /var/log -type f -exec truncate -s 0 {} \;
-
-          # Remove unnecessary locale data
-          rm -rf /usr/lib/locale/* || true
-
-          # Enable tty0 console
-          mkdir -p /etc/systemd/system/getty.target.wants
-          ln -sf /lib/systemd/system/getty@.service /etc/systemd/system/getty.target.wants/getty@tty0.service
-
-          # Create network initialization script
-          cat << 'NETSCRIPT' > /usr/local/bin/uml-net.sh
-          #!/bin/sh
-          set -e
-          DNS4="10.0.2.3"
-          DNS6="fec0::3"
-          TIMEOUT=30
-
-          find_iface() {
-              for _i in $(seq 1 "$TIMEOUT"); do
-                  for dev in vec0 eth0; do
-                      if ip link show "$dev" >/dev/null 2>&1; then echo "$dev"; return 0; fi
-                  done; sleep 1
-              done; return 1
-          }
-
-          IFACE=$(find_iface) || { echo "[uml-net] ERROR: no vec0 or eth0 after ${TIMEOUT}s" >&2; exit 1; }
-          ip link set "$IFACE" up
-
-          ip link add name vmbr0 type bridge 2>/dev/null || true
-          ip link set vmbr0 up
-
-          case "$IFACE" in
-              eth0) 
-                  ip link set eth0 master vmbr0 2>/dev/null || true
-                  ip addr add 10.0.2.1/24 dev vmbr0 2>/dev/null || true
-                  ip route replace default dev vmbr0 ;;
-              vec0) 
-                  ip link set vec0 master vmbr0 2>/dev/null || true
-                  ip addr add 10.0.2.15/24 dev vmbr0 2>/dev/null || true
-                  ip route replace default via 10.0.2.2 dev vmbr0
-                  ip -6 addr add fec0::15/64 dev vmbr0 2>/dev/null || true
-                  ip -6 route replace default via fec0::2 dev vmbr0 ;;
-          esac
-
-          printf "nameserver %s\nnameserver %s\n" "$DNS4" "$DNS6" > /etc/resolv.conf
-          NETSCRIPT
-
-          chmod +x /usr/local/bin/uml-net.sh
-
-          # Create network systemd service
-          cat << 'SERVICE' > /etc/systemd/system/uml-net.service
-          [Unit]
-          Description=UML network auto-config
-          After=network-pre.target systemd-udevd.service
-          Wants=network-pre.target
-          Before=network.target
-          DefaultDependencies=no
-
-          [Service]
-          Type=oneshot
-          ExecStart=/usr/local/bin/uml-net.sh
-          RemainAfterExit=yes
-
-          [Install]
-          WantedBy=multi-user.target
-          SERVICE
-
-          systemctl enable uml-net.service
-          EOF
-          
-          # 6. Unmount pseudo-filesystems
-          sudo umount mnt/proc
-          sudo umount mnt/sys
-          sudo umount mnt/dev
-          
-          # 7. Zero out free space for better compression
-          sudo zerofree -v mnt || true
-          
-          # 8. Unmount main image
-          sudo umount mnt
-          
-          # 9. Shrink filesystem to minimum size
-          sudo e2fsck -f debian.img
-          sudo resize2fs -M debian.img
-          
-          # 10. Truncate the image file to match the actual filesystem size
-          BLOCK_COUNT=$(sudo dumpe2fs -h debian.img 2>/dev/null | grep "Block count:" | awk '{print $3}')
-          BLOCK_SIZE=$(sudo dumpe2fs -h debian.img 2>/dev/null | grep "Block size:" | awk '{print $3}')
-          if [ -n "$BLOCK_COUNT" ] && [ -n "$BLOCK_SIZE" ]; then
-            NEW_SIZE=$((BLOCK_COUNT * BLOCK_SIZE + 65536))
-            truncate -s "$NEW_SIZE" debian.img
-          fi
-          
-          # 11. Compress with maximum xz compression
-          xz -9 -T0 -v debian.img
-          
-          # Show final size
-          ls -lh debian.img.xz
-
-      - name: Determine Release Tag
-        id: tag
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "tag_name=manual-build-$(date +%Y%m%d-%H%M%S)" >> $GITHUB_OUTPUT
-          else
-            echo "tag_name=${{ github.ref_name }}" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Create Release and Upload Asset
-        uses: softprops/action-gh-release@v3
+      - name: Upload Debian Image Artifact
+        uses: actions/upload-artifact@v4
         with:
-          tag_name: ${{ steps.tag.outputs.tag_name }}
-          name: Minimal Proxmox VE Trixie UML Image (${{ steps.tag.outputs.tag_name }})
-          draft: false
-          files: |
-            debian.img.xz
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: debian-pve-img
+          path: debian.img
+          compression-level: 6
