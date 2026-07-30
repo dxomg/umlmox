@@ -1,0 +1,23 @@
+[Unit]
+Description=Enable ZRAM Swap (100% Total RAM)
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash -c '\
+  swapoff /dev/zram0 2>/dev/null || true; \
+  echo 1 > /sys/block/zram0/reset 2>/dev/null || true; \
+  TOTAL_RAM_BYTES=$$(free -b | awk "/Mem:/ {print \$$2}"); \
+  echo lz4 > /sys/block/zram0/comp_algorithm 2>/dev/null || true; \
+  echo "$$TOTAL_RAM_BYTES" > /sys/block/zram0/disksize; \
+  mkswap /dev/zram0; \
+  swapon /dev/zram0 -p 100 \
+'
+ExecStop=/bin/bash -c '\
+  swapoff /dev/zram0 2>/dev/null || true; \
+  echo 1 > /sys/block/zram0/reset 2>/dev/null || true \
+'
+
+[Install]
+WantedBy=multi-user.target
